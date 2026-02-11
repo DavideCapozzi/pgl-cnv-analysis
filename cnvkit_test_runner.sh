@@ -1,125 +1,159 @@
 #!/bin/bash
 
 # =====================================================================
-# CNVkit Pipeline Runner - FIXED for v0.9.10 & Flat Reference
+# CNVkit Pipeline: Stable Batch Runner (v0.9.10)
+# Target: PGL WES - Tumor Only - Flat Reference
+# Optimization: Scatter removed to prevent race conditions/missing files
 # =====================================================================
 
-# --- CONFIGURAZIONE PATH (Verifica che siano corretti per il tuo sistema) ---
-# Directory base dove si trovano i dati
-BASE_DIR="/mnt/d/CNVkit/tumor/PTJ_WES_IDT-30802789"
-# Directory dove hai salvato la flat reference creata
-TARGETS_DIR="/mnt/d/CNVkit/tumor/tumor_targets"
-# Directory di output (verrà creata)
+# --- CONFIGURATION PATHS ---
+INPUT_BASE_DIR="/mnt/d/CNVkit/tumor/PTJ_WES_IDT-30802789"
+REF_DIR="/mnt/d/CNVkit/tumor/tumor_targets"
+REF_FILE="${REF_DIR}/flat_reference.cnn"
+VCF_LIST="${REF_DIR}/vcf_list.txt"
 OUT_DIR="/mnt/d/CNVkit/tumor/tumor_test_output"
 
-# File di riferimento (Flat Reference)
-REF_FILE="${TARGETS_DIR}/flat_reference.cnn"
-
-# Log files
-ERROR_LOG="${OUT_DIR}/pipeline_error.log"
-
-# Creazione directory
+# Ensure directories exist
 mkdir -p "$OUT_DIR"
 
 # =====================================================================
-# FUNZIONI
+# UTILITY FUNCTIONS
+# =====================================================================
+
+log_info() { echo -e "[INFO] $(date '+%H:%M:%S') - $1"; }
+log_error() { echo -e "[ERROR] $(date '+%H:%M:%S') - $1" >&2; }
+
+# Extract VCF path from the provided list file using grep
+get_vcf_from_list() {
+    local sample_name="$1"
+    local vcf_list="$2"
+    # Search for the sample name in the list and return the first match
+    grep "${sample_name}" "$vcf_list" | head -n 1
+}
+
+# =====================================================================
+# CORE PROCESSING FUNCTION
 # =====================================================================
 
 process_sample() {
     local bam_file="$1"
-    local sample_name=$(basename "$bam_file" | sed 's/.bam//')
-    local sample_out_dir="${OUT_DIR}/${sample_name}"
+    local sample_name=$(basename "$bam_file" .bam)
+    local sample_dir="${OUT_DIR}/${sample_name}"
     
-    echo "[INFO] Processing sample: ${sample_name}"
-    mkdir -p "$sample_out_dir"
+    # Define outputs
+    local cnr_file="${sample_dir}/${sample_name}.cnr"
+    local cns_file="${sample_dir}/${sample_name}.cns"
+    local call_file="${sample_dir}/${sample_name}.call.cns"
+    local breaks_file="${sample_dir}/${sample_name}.breaks.txt"
+    local genemetrics_file="${sample_dir}/${sample_name}.genemetrics.txt"
 
-    # ---------------------------------------------------------
-    # STEP 1: CNVkit Batch (Coverage -> Fix -> Segment)
-    # ---------------------------------------------------------
-    # NOTA: Rimosse opzioni -t, -a, -f perché incompatibili con -r
-    # NOTA: Rimosso --prune (deprecated)
-    # NOTA: Aggiunto --drop-low-coverage e --segment-method cbs per Flat Ref
+    log_info "Processing sample: ${sample_name}"
+    mkdir -p "$sample_dir"
+
+    # --- STEP 1: BATCH (Coverage -> Fix -> Segment) ---
+    # CRITICAL CHANGE: Removed --scatter and --diagram to prevent file writing errors.
+    # Added explicit check [[ -f $cns_file ]] to ensure success.
     
-    echo "[EXEC] Running batch with Flat Reference..."
+    log_info "Running batch (Coverage + Segmentation)..."
     
     cnvkit.py batch "$bam_file" \
-        -r "$REF_FILE" \
-        --output-dir "$sample_out_dir" \
+        --reference "$REF_FILE" \
+        --output-dir "$sample_dir" \
         --segment-method cbs \
         --drop-low-coverage \
-        --scatter \
-        --diagram \
-        -p $(nproc)
+        --processes $(nproc) \
+    && [[ -f "$cns_file" ]] \
+    && log_info "Batch completed. CNS generated: $cns_file" \
+    || { log_error "Batch failed or CNS not created for ${sample_name}"; return 1; }
 
-    if [ $? -ne 0 ]; then
-        echo "[ERROR] Batch failed for ${sample_name}" | tee -a "$ERROR_LOG"
-        return 1
-    fi
-
-    # ---------------------------------------------------------
-    # STEP 2: Integrazione VCF (Call & BAF)
-    # ---------------------------------------------------------
-    # Cerchiamo il VCF corrispondente
-    # Pattern: Cerca file che iniziano con il nome del sample e contengono "hard-filtered"
-    vcf_file=$(find "$BASE_DIR" -type f -name "${sample_name}*.hard-filtered.vcf.gz" | head -n 1)
-
-    # Se non trova .gz, cerca .vcf non compresso
-    if [ -z "$vcf_file" ]; then
-        vcf_file=$(find "$BASE_DIR" -type f -name "${sample_name}*.hard-filtered.vcf" | head -n 1)
-    fi
-
-    local cns_file="${sample_out_dir}/${sample_name}.cns"
-
-    if [[ -f "$vcf_file" && -f "$cns_file" ]]; then
-        echo "[INFO] Found VCF: $(basename "$vcf_file"). Running CALL with BAF..."
-        
-        # CNVkit Call usando il VCF per calcolare la BAF
-        cnvkit.py call "$cns_file" \
-            --vcf "$vcf_file" \
-            --method clonal \
-            -o "${sample_out_dir}/${sample_name}_call.cns"
-            
-        echo "[SUCCESS] Call completed with VCF integration."
-    else
-        echo "[WARNING] VCF not found for ${sample_name} OR .cns missing. Running call without VCF."
-        
-        cnvkit.py call "$cns_file" \
-            --method clonal \
-            -o "${sample_out_dir}/${sample_name}_call.cns"
-    fi
-
-    # ---------------------------------------------------------
-    # STEP 3: Genemetrics
-    # ---------------------------------------------------------
-    local cnr_file="${sample_out_dir}/${sample_name}.cnr"
-    local call_file="${sample_out_dir}/${sample_name}_call.cns"
+    # --- STEP 2: CALLING (With VCF Integration) ---
+    local vcf_path=$(get_vcf_from_list "$sample_name" "$VCF_LIST")
     
-    if [[ -f "$cnr_file" && -f "$call_file" ]]; then
-        echo "[EXEC] Generating genemetrics..."
+    if [[ -n "$vcf_path" && -f "$vcf_path" ]]; then
+        log_info "VCF found: $(basename "$vcf_path"). Running Clonal Call..."
+        
+        cnvkit.py call "$cns_file" \
+            --vcf "$vcf_path" \
+            --method clonal \
+            --output "$call_file" \
+        && log_info "Call (with VCF) completed." \
+        || log_error "Call failed despite VCF presence."
+    else
+        log_info "VCF NOT found in list. Running basic Call..."
+        
+        cnvkit.py call "$cns_file" \
+            --method clonal \
+            --output "$call_file" \
+        && log_info "Call (basic) completed."
+    fi
+
+    # --- STEP 3: DOWNSTREAM (Breaks & Genemetrics) ---
+    # Only execute if call file was created successfully
+    [[ -f "$call_file" ]] && {
+        log_info "Generating metrics..."
+        
+        # Breaks
+        cnvkit.py breaks "$cnr_file" "$cns_file" \
+            --min-probes 5 \
+            | tee "$breaks_file" > /dev/null
+            
+        # Genemetrics
         cnvkit.py genemetrics "$cnr_file" \
             -s "$call_file" \
             --drop-low-coverage \
-            -o "${sample_out_dir}/${sample_name}_genemetrics.txt"
-    fi
+            --output "$genemetrics_file" \
+        && log_info "Metrics generated."
+    } || log_error "Skipping metrics: Call file missing."
+
+    echo "---------------------------------------------------"
 }
 
 # =====================================================================
-# MAIN LOOP
+# HEATMAP MODULE
 # =====================================================================
 
-echo "=== STARTING PIPELINE ==="
-echo "Reference: $REF_FILE"
+generate_heatmaps() {
+    log_info "Generating Cohort Heatmaps..."
+    
+    local heatmap_dir="${OUT_DIR}/heatmaps"
+    mkdir -p "$heatmap_dir"
+    
+    # Priority: Use .call.cns (ploidy corrected) if available, else .cns
+    local cns_list=$(find "$OUT_DIR" -name "*.call.cns")
+    
+    if [[ -z "$cns_list" ]]; then
+        log_error "No .call.cns files found. Trying standard .cns..."
+        cns_list=$(find "$OUT_DIR" -name "*.cns" ! -name "*.call.cns" ! -name "*.bintest.cns")
+    fi
 
-# Verifica esistenza reference
-if [ ! -f "$REF_FILE" ]; then
-    echo "[FATAL] Reference file not found at $REF_FILE"
-    exit 1
-fi
+    [[ -n "$cns_list" ]] && {
+        # Global Heatmap
+        cnvkit.py heatmap $cns_list -d -o "${heatmap_dir}/cohort_heatmap_all.pdf" && \
+        log_info "Global heatmap created."
 
-# Loop su tutti i file BAM nella directory dei tumori
-# Modifica il pattern "-t*.bam" se i tuoi file hanno nomi diversi (es. "*.bam")
-find "$BASE_DIR" -type f -name "*-t*.bam" | sort | while read bam_file; do
+        # PGL Specific Chromosomes
+        for chr in chr1 chr11 chr22; do
+             cnvkit.py heatmap $cns_list -d -c "$chr" -o "${heatmap_dir}/cohort_heatmap_${chr}.pdf"
+        done
+    } || log_error "No CNS files available for heatmap."
+}
+
+# =====================================================================
+# MAIN EXECUTION
+# =====================================================================
+
+log_info "=== STARTING PIPELINE ==="
+
+# Check requirements
+[[ ! -f "$REF_FILE" ]] && { log_error "Reference file missing: $REF_FILE"; exit 1; }
+[[ ! -f "$VCF_LIST" ]] && { log_error "VCF List missing: $VCF_LIST"; exit 1; }
+
+# Find BAMs and process
+find "$INPUT_BASE_DIR" -type f -name "*-t.bam" | sort | while read bam_file; do
     process_sample "$bam_file"
 done
 
-echo "=== PIPELINE COMPLETED ==="
+# Generate final visualizations
+generate_heatmaps
+
+log_info "=== PIPELINE COMPLETED ==="
