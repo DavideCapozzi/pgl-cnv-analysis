@@ -1,0 +1,49 @@
+name: pgl-cnv-analysis
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  # =======================================================
+  # CORE - Usiamo Python 3.9 per massima compatibilità
+  # con Pandas < 2.0 e vecchi pacchetti bio
+  # =======================================================
+  - python=3.9
+
+  # =======================================================
+  # BIOINFORMATICA
+  # =======================================================
+  - cnvkit
+  - samtools
+  - tabix
+  - picard
+  - pysam
+  - biopython
+
+  # =======================================================
+  # STACK SCIENTIFICO (Vincolato per CNVkit)
+  # =======================================================
+  # Pandas < 2.0 risolve l'errore Int64Index
+  - pandas<2.0
+  # Numpy < 1.24 è obbligatorio per Pandas < 2.0
+  - numpy<1.24
+  - scipy
+  - matplotlib-base
+  - seaborn
+  - scikit-learn
+  - reportlab
+  # Pomegranate spesso da problemi, lasciamo libero il solver
+  # o usiamo una versione compatibile con Py3.9
+  - pomegranate
+
+  # =======================================================
+  # UTILITIES
+  # =======================================================
+  - pip
+  - wget
+
+  # =======================================================
+  # PIP
+  # =======================================================
+  - pip:
+    - SigProfilerMatrixGenerator
