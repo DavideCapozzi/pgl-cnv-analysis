@@ -5,15 +5,13 @@ channels:
   - nodefaults
 dependencies:
   # =======================================================
-  # CORE - Usiamo Python 3.9 per massima compatibilità
-  # con Pandas < 2.0 e vecchi pacchetti bio
+  # CORE
   # =======================================================
   - python=3.9
 
   # =======================================================
-  # BIOINFORMATICA
+  # BIOINFORMATICS
   # =======================================================
-  - cnvkit
   - samtools
   - tabix
   - picard
@@ -21,19 +19,17 @@ dependencies:
   - biopython
 
   # =======================================================
-  # STACK SCIENTIFICO (Vincolato per CNVkit)
+  # SCIENTIFIC STACK
   # =======================================================
-  # Pandas < 2.0 risolve l'errore Int64Index
+  # Pandas < 2.0 mandatory for CNVkit 0.9.10
   - pandas<2.0
-  # Numpy < 1.24 è obbligatorio per Pandas < 2.0
-  - numpy<1.24
+  # Numpy < 2.0 mandatory for CNVkit 0.9.10, 1.26.4 is the last stable version before 2.0
+  - numpy>=1.22,<2.0
   - scipy
   - matplotlib-base
   - seaborn
   - scikit-learn
   - reportlab
-  # Pomegranate spesso da problemi, lasciamo libero il solver
-  # o usiamo una versione compatibile con Py3.9
   - pomegranate
 
   # =======================================================
@@ -46,4 +42,6 @@ dependencies:
   # PIP
   # =======================================================
   - pip:
+    # Forced numpy version to avoid update from sigprofilermatrixgenerator
+    - numpy<2.0 
     - SigProfilerMatrixGenerator
