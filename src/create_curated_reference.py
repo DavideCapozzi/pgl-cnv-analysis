@@ -214,9 +214,9 @@ def build_reference_matrix(file_dict, inclusion_map):
     ref_depth[np.isnan(ref_depth)] = safe_depth
 
     # 2. Spread Filling (The most critical part for segmentation)
-    #    Calculate a robust global spread (Median) to fill gaps
-    global_median_spread = np.nanmedian(ref_spread)
-    safe_spread_val = global_median_spread if not np.isnan(global_median_spread) else 0.1
+    #    Calculate a robust global spread (75 percentile) to fill gaps
+    global_conservative_spread = np.nanpercentile(ref_spread, 75)
+    safe_spread_val = global_conservative_spread if not np.isnan(global_conservative_spread) else 0.1
     
     # Fill NaN spreads.
     # This covers two cases:
