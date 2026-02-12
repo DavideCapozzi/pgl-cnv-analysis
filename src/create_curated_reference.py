@@ -110,15 +110,20 @@ def validate_compatibility(template_df, new_df, sample_name):
 
 def build_reference_matrix(file_dict, inclusion_map):
     """
-    Vectorized construction of the reference profile.
-    Uses masks to include only clean chromosomes per sample.
+    Vectorized construction of the reference profile with Robust Statistics.
+    
+    Improvements:
+    - Uses ddof=1 for std dev to correctly handle single-sample bins (returns NaN instead of 0).
+    - Uses Median instead of Mean for fallback spread (robust to outliers).
+    - Strict float32 usage for memory efficiency.
     """
     if not file_dict:
         raise ValueError("No input files provided to build_reference_matrix.")
 
     sample_ids = list(file_dict.keys())
     
-    # 1. Load Template (First Sample)
+    # 1. Load Template (First Sample) to establish bin structure
+    #    We use 'read' from cnvlib to ensure correct parsing of .cnn format
     template_cnv = cnvlib.read(file_dict[sample_ids[0]])
     template_df = template_cnv.data
     
@@ -127,14 +132,15 @@ def build_reference_matrix(file_dict, inclusion_map):
     
     logger.info(f"Initializing matrix: {n_bins} bins x {n_samples} samples")
 
-    # 2. Pre-allocate NumPy arrays (float32 saves RAM)
+    # 2. Pre-allocate NumPy arrays (float32 saves RAM and is sufficient for log2 data)
+    #    Initialize with NaN to represent "masked" or "missing" data by default
     mat_log2 = np.full((n_bins, n_samples), np.nan, dtype=np.float32)
     mat_depth = np.full((n_bins, n_samples), np.nan, dtype=np.float32)
     
-    # Pre-calculate chromosome vector for the template
+    # Vector of chromosome names for fast masking
     template_chroms = np.array([normalize_chrom(c) for c in template_df['chromosome']])
 
-    # 3. Vectorized Loading & Masking
+    # 3. Iterative Loading & Masking (IO bound step)
     valid_samples_count = 0
     
     for i, sample_id in enumerate(sample_ids):
@@ -142,18 +148,22 @@ def build_reference_matrix(file_dict, inclusion_map):
             curr_cnv = cnvlib.read(file_dict[sample_id])
             validate_compatibility(template_df, curr_cnv.data, sample_id)
             
-            allowed = set([normalize_chrom(c) for c in inclusion_map.get(sample_id, [])])
-            if not allowed:
-                logger.warning(f"Sample {sample_id} has no allowed chromosomes in map. Skipping.")
+            # Retrieve allowed chromosomes for this specific sample
+            allowed_chroms = set([normalize_chrom(c) for c in inclusion_map.get(sample_id, [])])
+            
+            if not allowed_chroms:
+                logger.warning(f"Sample {sample_id} excluded (no allowed chromosomes).")
                 continue
 
-            # Create boolean mask for rows belonging to allowed chromosomes
-            keep_mask = np.isin(template_chroms, list(allowed))
+            # Boolean mask: True if bin belongs to an allowed chromosome
+            # np.isin is optimized for this type of set membership check
+            keep_mask = np.isin(template_chroms, list(allowed_chroms))
             
-            raw_log2 = curr_cnv.data['log2'].values
-            raw_depth = curr_cnv.data['depth'].values
+            # Extract values
+            raw_log2 = curr_cnv.data['log2'].values.astype(np.float32)
+            raw_depth = curr_cnv.data['depth'].values.astype(np.float32)
             
-            # Fill the matrix only where mask is True (other rows remain NaN)
+            # Assign only valid rows to the matrix
             mat_log2[keep_mask, i] = raw_log2[keep_mask]
             mat_depth[keep_mask, i] = raw_depth[keep_mask]
             
@@ -163,55 +173,77 @@ def build_reference_matrix(file_dict, inclusion_map):
             logger.error(f"Error processing {sample_id}: {e}")
 
     if valid_samples_count == 0:
-        raise RuntimeError("No valid samples were processed. Check your paths and Inclusion Map.")
+        raise RuntimeError("No valid samples processed. Cannot build reference.")
 
-    # 4. Statistical Reduction (Row-wise)
-    logger.info("Computing reference statistics...")
+    # 4. Statistical Reduction (Vectorized)
+    logger.info("Computing robust reference statistics...")
     
-    # Use context manager to strictly suppress "Mean of empty slice" warnings.
-    # Empty slices are EXPECTED here (regions where no sample is clean) and handled below.
     with warnings.catch_warnings():
+        # Suppress "Mean of empty slice" or "Degrees of freedom <= 0"
         warnings.simplefilter("ignore", category=RuntimeWarning)
         
+        # A. Reference Log2 (Mean of valid samples)
         ref_log2 = np.nanmean(mat_log2, axis=1)
+        
+        # B. Reference Depth (Mean of valid samples)
         ref_depth = np.nanmean(mat_depth, axis=1)
-        ref_spread = np.nanstd(mat_log2, axis=1)
+        
+        # C. Reference Spread (Standard Deviation)
+        # CRITICAL: ddof=1 means Sample Std Dev. 
+        # If N=1 (only 1 sample valid), this returns NaN.
+        # If N=0 (no samples valid), this returns NaN.
+        # This is safer than ddof=0 which returns 0.0 for N=1.
+        ref_spread = np.nanstd(mat_log2, axis=1, ddof=1)
 
-    # 5. Flat Fallback Logic
-    # Identify bins where ALL samples were masked (NaN)
+    # 5. Handling Missing Data & Fallback (Vectorized)
+    
+    # Identify "Fallback" bins: where Log2 is NaN (0 valid samples)
     fallback_mask = np.isnan(ref_log2)
     n_fallback = np.sum(fallback_mask)
     
-    if n_fallback > 0:
-        percent = (n_fallback / n_bins) * 100
-        logger.warning(f"Fallback triggered for {n_fallback} bins ({percent:.2f}%).")
-        
-        # A. Set Log2 to 0.0 (Neutral/Flat)
-        ref_log2[fallback_mask] = 0.0
-        
-        # B. Set Depth to Global Mean (estimated from valid regions)
-        global_mean_depth = np.nanmean(ref_depth)
-        ref_depth[fallback_mask] = global_mean_depth if not np.isnan(global_mean_depth) else 1.0
-        
-        # C. Set Spread to Global Mean Spread (estimated from valid regions)
-        global_mean_spread = np.nanmean(ref_spread)
-        safe_spread = global_mean_spread if not np.isnan(global_mean_spread) else 0.1
-        
-        # Apply spread to fallback regions and any other NaNs
-        ref_spread[fallback_mask] = safe_spread
-        ref_spread[np.isnan(ref_spread)] = safe_spread
+    # --- FILLING STRATEGY ---
+    
+    # 1. Depth Filling
+    #    Fill NaNs and zeros with global mean depth
+    global_mean_depth = np.nanmean(ref_depth)
+    safe_depth = global_mean_depth if not np.isnan(global_mean_depth) else 1.0
+    
+    # Clamp minimum depth to epsilon (avoid log(0))
+    ref_depth = np.maximum(ref_depth, 1e-6)
+    # Fill NaN depths (fallback regions)
+    ref_depth[np.isnan(ref_depth)] = safe_depth
 
-    # 6. Construct Final Object
-    # We copy the template structure and replace data columns
+    # 2. Spread Filling (The most critical part for segmentation)
+    #    Calculate a robust global spread (Median) to fill gaps
+    global_median_spread = np.nanmedian(ref_spread)
+    safe_spread_val = global_median_spread if not np.isnan(global_median_spread) else 0.1
+    
+    # Fill NaN spreads.
+    # This covers two cases:
+    #   a) Fallback regions (0 samples)
+    #   b) Single-sample regions (1 sample -> std=NaN due to ddof=1)
+    ref_spread[np.isnan(ref_spread)] = safe_spread_val
+    
+    # Clamp minimum spread to prevent infinite weights
+    MIN_SPREAD = 0.001
+    ref_spread = np.maximum(ref_spread, MIN_SPREAD)
+
+    # 3. Log2 Filling (Flat Fallback)
+    if n_fallback > 0:
+        pct = (n_fallback / n_bins) * 100
+        logger.warning(f"Fallback triggered for {n_fallback} bins ({pct:.2f}%). Set to log2=0.0")
+        ref_log2[fallback_mask] = 0.0
+
+    # 6. Final Object Construction
     final_cnv = template_cnv.copy()
     final_cnv.data['log2'] = ref_log2
     final_cnv.data['depth'] = ref_depth
     final_cnv.data['spread'] = ref_spread
     
-    # Recalculate Weights (Inverse variance weighting: weight ~ 1 / spread^2)
-    # Clip spread to avoid division by zero
-    clipped_spread = np.maximum(ref_spread, 1e-4)
-    final_cnv.data['weight'] = 1.0 / (clipped_spread ** 2)
+    # Weight Calculation
+    # weight = 1 / variance = 1 / (spread^2)
+    # Since we clamped spread >= 0.001, this is safe.
+    final_cnv.data['weight'] = 1.0 / (ref_spread ** 2)
     
     return final_cnv
 
