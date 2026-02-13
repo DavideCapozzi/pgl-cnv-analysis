@@ -9,9 +9,13 @@
 # --- CONFIGURATION PATHS ---
 INPUT_BASE_DIR="/mnt/d/CNVkit/tumor/PTJ_WES_IDT-30802789"
 REF_DIR="/mnt/d/CNVkit/tumor/tumor_targets"
-REF_FILE="${REF_DIR}/flat_reference.cnn"
+REF_FILE="${REF_DIR}/curated_flat_reference.cnn"
 VCF_LIST="${REF_DIR}/vcf_list.txt"
-OUT_DIR="/mnt/d/CNVkit/tumor/tumor_test_output"
+
+
+# --- DERIVED PATHS ---
+REF_BASENAME=$(basename "${REF_FILE%.*}")
+OUT_DIR="/mnt/d/CNVkit/tumor/tumor_newout/${REF_BASENAME}_output"
 
 # Ensure directories exist
 mkdir -p "$OUT_DIR"

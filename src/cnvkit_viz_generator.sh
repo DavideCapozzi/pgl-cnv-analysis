@@ -8,7 +8,7 @@
 
 # --- CONFIGURATION PATHS ---
 # Must match the output dir of the processor script
-OUT_DIR="/mnt/d/CNVkit/tumor/tumor_test_output"
+OUT_DIR="/mnt/d/CNVkit/tumor/tumor_newout/curated_flat_reference_output"
 VIZ_DIR="${OUT_DIR}/visualizations"
 
 mkdir -p "$VIZ_DIR"
