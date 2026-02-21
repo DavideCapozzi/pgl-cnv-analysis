@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-CNVkit Dynamic Curated Flat Reference Builder (v3.0)
+CNVkit Dynamic Curated Flat Reference Builder (v3.1)
 ------------------------------------------------------
 Strategy: "Autosomal Global QC -> Biological Segment Masking -> Robust Consensus"
 Context:  Paraganglioma (PGL) Tumor-Only WES analysis.
 
-Core Algorithm (v3.0):
-  Overcomes the "Cohort Flattening" paradox (where recurrent large deletions 
-  like 1p/11q become the baseline). It computes a 75th-percentile crude baseline
-  to anchor to the diploid state, applies a rolling median to isolate broad 
+Core Algorithm (v3.1):
+  Overcomes the "Cohort Flattening" paradox. Computes a 75th-percentile crude baseline
+  to anchor to the diploid state, applies a modular rolling median to isolate broad 
   somatic CNVs from bin-level technical noise, and actively masks pathological 
   segments (NaN) before computing the final technical baseline and DDOF=1 spread.
 """
@@ -19,7 +18,7 @@ import os
 import argparse
 import logging
 import warnings
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -90,6 +89,36 @@ def locate_files(base_dir: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     return {s: targets[s] for s in common_samples}, {s: antitargets[s] for s in common_samples}
 
 # =============================================================================
+# CORE ALGORITHMS
+# =============================================================================
+
+def _apply_biological_mask(mat_log2: np.ndarray, base_track: np.ndarray, 
+                           window: int, threshold: float) -> np.ndarray:
+    """
+    Isolates and masks broad biological events using a rolling median low-pass filter.
+    Returns a boolean mask of positions to replace with NaN to protect the baseline.
+    """
+    tumor_mask = np.zeros_like(mat_log2, dtype=bool)
+    
+    for i in range(mat_log2.shape[1]):
+        sample_track = mat_log2[:, i]
+        
+        # Skip if the track is mostly empty
+        if np.isnan(sample_track).mean() > 0.90:
+            continue
+            
+        residuals = sample_track - base_track
+        
+        # Pandas rolling median isolates segment-level biological shifts
+        smoothed_signal = pd.Series(residuals).rolling(
+            window=window, center=True, min_periods=1
+        ).median().values
+        
+        tumor_mask[:, i] = np.abs(smoothed_signal) > threshold
+        
+    return tumor_mask
+
+# =============================================================================
 # DYNAMIC EVALUATION ENGINE
 # =============================================================================
 
@@ -135,8 +164,6 @@ def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], p
     clean_mat = mat_log2[:, good_sample_indices]
     
     # --- STEP 2: ROBUST CHROMOSOME-LEVEL EVALUATION ---
-    # Using 75th percentile as crude baseline prevents >50% recurrent deletions 
-    # from skewing the expected diploid 0.0 axis.
     logger.info("Evaluating chromosomal shifts against crude 75th-percentile baseline...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -170,7 +197,8 @@ def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], p
                 
             report_data.append((sid, chrom, chrom_shift, chrom_iqr, status, reason))
 
-    return inclusion_map, pd.DataFrame(report_data, columns=["Sample", "Chromosome", "Median_Shift", "IQR_Noise", "Status", "Reason"]), good_sample_ids
+    report_df = pd.DataFrame(report_data, columns=["Sample", "Chromosome", "Median_Shift", "IQR_Noise", "Status", "Reason"])
+    return inclusion_map, report_df, good_sample_ids
 
 # =============================================================================
 # MATRIX BUILDER WITH BIOLOGICAL MASKING
@@ -201,33 +229,35 @@ def build_reference_matrix(file_dict: Dict[str, str], inclusion_map: Dict[str, L
         crude_baseline = np.nanpercentile(mat_log2, 75, axis=1)
         
     masked_segments_count = 0
+    sample_mask_counts = {sid: 0 for sid in good_sample_ids}
     
-    for i in range(len(good_sample_ids)):
-        for chrom in unique_chroms:
-            mask = chrom_masks[chrom]
-            if not np.any(mask): 
-                continue
-                
-            sample_track = mat_log2[mask, i]
-            base_track = crude_baseline[mask]
+    for chrom in unique_chroms:
+        mask = chrom_masks[chrom]
+        if not np.any(mask): 
+            continue
             
-            if np.isnan(sample_track).mean() > 0.90:
-                continue
-                
-            residuals = sample_track - base_track
-            # Rolling median smooths out bin-level technical noise, leaving only broad biological events
-            smoothed_signal = pd.Series(residuals).rolling(
-                window=BIOLOGICAL_SMOOTHING_WINDOW, center=True, min_periods=1
-            ).median().values
+        chrom_log2 = mat_log2[mask, :]
+        chrom_base = crude_baseline[mask]
+        
+        tumor_mask = _apply_biological_mask(
+            mat_log2=chrom_log2, 
+            base_track=chrom_base, 
+            window=BIOLOGICAL_SMOOTHING_WINDOW, 
+            threshold=MAX_BIOLOGICAL_DEVIATION
+        )
+        
+        if np.any(tumor_mask):
+            mat_log2[mask, :][tumor_mask] = np.nan
+            masked_segments_count += np.sum(tumor_mask)
             
-            # Identify broad biological segments (e.g. 1p/11q deletions)
-            tumor_mask = np.abs(smoothed_signal) > MAX_BIOLOGICAL_DEVIATION
-            
-            if np.any(tumor_mask):
-                mat_log2[mask, i][tumor_mask] = np.nan
-                masked_segments_count += np.sum(tumor_mask)
+            # Track masking per sample for reporting
+            for i, sid in enumerate(good_sample_ids):
+                sample_mask_counts[sid] += np.sum(tumor_mask[:, i])
                 
-    logger.info(f"Masked {masked_segments_count} tumor-driven bins across cohort to protect baseline.")
+    logger.info(f"Total bins masked across cohort: {masked_segments_count}")
+    for sid, count in sample_mask_counts.items():
+        if count > 0:
+            logger.debug(f"  [-] {sid}: {count} bins masked")
 
     # --- FINAL CONSENSUS & SAFETY CLAMPING ---
     logger.info("Calculating robust statistics and enforcing safety clamps...")
@@ -269,7 +299,12 @@ def main():
     parser.add_argument("-i", "--input", required=True, help="Path to directory containing .cnn files")
     parser.add_argument("-o", "--output", required=True, help="Output path for the curated reference.cnn")
     parser.add_argument("-r", "--report", required=False, help="Optional output path for TSV report (file or directory)")
+    # Added verbosity flag to see debug info (like per-sample masking)
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose/debug logging")
     args = parser.parse_args()
+    
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
     
     logger.info("--- Phase 1: Locating Files ---")
     targets_map, antitargets_map = locate_files(args.input)
