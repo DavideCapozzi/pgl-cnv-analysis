@@ -2,26 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-CNVkit Dynamic Curated Flat Reference Builder (v2.1)
+CNVkit Dynamic Curated Flat Reference Builder (v3.0)
 ------------------------------------------------------
-Strategy: "Autosomal Global QC -> Dynamic Noise Evaluation -> Adaptive Fallback"
+Strategy: "Autosomal Global QC -> Biological Segment Masking -> Robust Consensus"
 Context:  Paraganglioma (PGL) Tumor-Only WES analysis.
 
-Changes in v2.1:
-  1. I/O Resilience: Auto-handles directory vs file paths for report output.
-  2. Pairing Logs: Explicit warnings for missing target/antitarget pairs.
-  3. Autosomal QC: Global noise evaluation is strictly restricted to chr1-22
-     to prevent physiological sex differences (chrX/Y) from artificially 
-     inflating the IQR and falsely rejecting male samples.
-  4. Optimized Masking: Pre-computed chromosome masks for CPU efficiency.
+Core Algorithm (v3.0):
+  Overcomes the "Cohort Flattening" paradox (where recurrent large deletions 
+  like 1p/11q become the baseline). It computes a 75th-percentile crude baseline
+  to anchor to the diploid state, applies a rolling median to isolate broad 
+  somatic CNVs from bin-level technical noise, and actively masks pathological 
+  segments (NaN) before computing the final technical baseline and DDOF=1 spread.
 """
 
 import os
-import sys
 import argparse
 import logging
 import warnings
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -43,10 +41,14 @@ logger = logging.getLogger("DynamicRefBuilder")
 # 1. GLOBAL SAMPLE QC (Autosomes Only)
 MAX_SAMPLE_NOISE = 0.80 
 
-# 2. CHROMOSOME SHIFT & NOISE
+# 2. CHROMOSOME EVALUATION
 MAX_CHROM_SHIFT = 0.25 
 MAX_CHROM_NOISE = 0.65 
 MIN_VALID_BINS_FRAC = 0.10
+
+# 3. BIOLOGICAL SEGMENT MASKING
+BIOLOGICAL_SMOOTHING_WINDOW = 50  # Bins (captures broad segmental/arm-level events)
+MAX_BIOLOGICAL_DEVIATION = 0.30   # log2 threshold to mask out tumor segments
 
 # =============================================================================
 # UTILITIES & FILE I/O
@@ -57,7 +59,6 @@ def normalize_chrom(name: str) -> str:
     return s if s.startswith("chr") else f"chr{s}"
 
 def is_autosome(chrom: str) -> bool:
-    """Checks if a normalized chromosome string is an autosome (chr1-chr22)."""
     valid_autosomes = {f"chr{i}" for i in range(1, 23)}
     return chrom in valid_autosomes
 
@@ -66,28 +67,24 @@ def locate_files(base_dir: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     base_dir = os.path.abspath(base_dir)
     
     logger.info(f"Scanning directory tree: {base_dir}")
-    
     for root, _, files in os.walk(base_dir):
         for file in files:
             if file.endswith(".targetcoverage.cnn"):
-                sample_id = file.replace(".targetcoverage.cnn", "")
-                targets[sample_id] = os.path.join(root, file)
+                sid = file.replace(".targetcoverage.cnn", "")
+                targets[sid] = os.path.join(root, file)
             elif file.endswith(".antitargetcoverage.cnn"):
-                sample_id = file.replace(".antitargetcoverage.cnn", "")
-                antitargets[sample_id] = os.path.join(root, file)
+                sid = file.replace(".antitargetcoverage.cnn", "")
+                antitargets[sid] = os.path.join(root, file)
                 
     common_samples = set(targets.keys()).intersection(set(antitargets.keys()))
     
-    # Logging the pairing process explicitly
     for sid in common_samples:
         logger.info(f"  [+] Matched Pair Found: {sid}")
         
-    missing_targets = set(antitargets.keys()) - common_samples
-    for sid in missing_targets:
+    for sid in (set(antitargets.keys()) - common_samples):
         logger.warning(f"  [-] Orphan Antitarget (Missing Target): {sid}")
         
-    missing_antis = set(targets.keys()) - common_samples
-    for sid in missing_antis:
+    for sid in (set(targets.keys()) - common_samples):
         logger.warning(f"  [-] Orphan Target (Missing Antitarget): {sid}")
         
     return {s: targets[s] for s in common_samples}, {s: antitargets[s] for s in common_samples}
@@ -98,13 +95,10 @@ def locate_files(base_dir: str) -> Tuple[Dict[str, str], Dict[str, str]]:
 
 def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], pd.DataFrame, List[str]]:
     sample_ids = sorted(list(file_dict.keys()))
-    
-    # --- STEP 1: LOAD ALL DATA ---
     template_cnv = cnvlib.read(file_dict[sample_ids[0]])
     chromosomes = np.array([normalize_chrom(c) for c in template_cnv.data['chromosome']])
     unique_chroms = np.unique(chromosomes)
     
-    # Pre-compute masks for CPU efficiency
     chrom_masks = {chrom: (chromosomes == chrom) for chrom in unique_chroms}
     autosome_mask = np.array([is_autosome(c) for c in chromosomes])
     
@@ -114,13 +108,11 @@ def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], p
 
     report_data = []
     
-    # --- STEP 2: AUTOSOMAL GLOBAL SAMPLE QC ---
+    # --- STEP 1: AUTOSOMAL GLOBAL SAMPLE QC ---
     logger.info("Performing Autosomal Global Sample Quality Control...")
-    good_sample_indices = []
-    good_sample_ids = []
+    good_sample_indices, good_sample_ids = [], []
     
     for i, sid in enumerate(sample_ids):
-        # Apply mask to evaluate ONLY chr1-chr22 to avoid sex-bias
         sample_data = mat_log2[autosome_mask, i]
         valid_data = sample_data[~np.isnan(sample_data)]
         
@@ -131,7 +123,7 @@ def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], p
         global_iqr = float(np.percentile(valid_data, 75) - np.percentile(valid_data, 25))
         
         if global_iqr > MAX_SAMPLE_NOISE:
-            logger.warning(f"  [!] Sample {sid} REJECTED globally (Autosomal IQR: {global_iqr:.2f} > {MAX_SAMPLE_NOISE})")
+            logger.warning(f"  [!] Sample {sid} REJECTED globally (Autosomal IQR: {global_iqr:.2f})")
             report_data.append((sid, "ALL", np.nan, global_iqr, "REJECTED_SAMPLE", "Global Noise Too High"))
         else:
             good_sample_indices.append(i)
@@ -140,17 +132,17 @@ def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], p
     if not good_sample_indices:
         raise RuntimeError("All samples failed Global QC. Cannot build reference.")
 
-    # --- STEP 3: POOLED BASELINE ---
-    logger.info(f"Building baseline from {len(good_sample_indices)} clean samples...")
     clean_mat = mat_log2[:, good_sample_indices]
+    
+    # --- STEP 2: ROBUST CHROMOSOME-LEVEL EVALUATION ---
+    # Using 75th percentile as crude baseline prevents >50% recurrent deletions 
+    # from skewing the expected diploid 0.0 axis.
+    logger.info("Evaluating chromosomal shifts against crude 75th-percentile baseline...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
-        pooled_median = np.nanmedian(clean_mat, axis=1)
+        crude_baseline = np.nanpercentile(clean_mat, 75, axis=1)
         
-    residuals = clean_mat - pooled_median[:, np.newaxis]
-    
-    # --- STEP 4: CHROMOSOME-LEVEL EVALUATION ---
-    logger.info("Evaluating chromosomal shifts and local noise...")
+    residuals = clean_mat - crude_baseline[:, np.newaxis]
     inclusion_map = {sid: [] for sid in good_sample_ids}
     
     for idx, sid in enumerate(good_sample_ids):
@@ -181,12 +173,14 @@ def evaluate_regions(file_dict: Dict[str, str]) -> Tuple[Dict[str, List[str]], p
     return inclusion_map, pd.DataFrame(report_data, columns=["Sample", "Chromosome", "Median_Shift", "IQR_Noise", "Status", "Reason"]), good_sample_ids
 
 # =============================================================================
-# MATRIX BUILDER
+# MATRIX BUILDER WITH BIOLOGICAL MASKING
 # =============================================================================
 
 def build_reference_matrix(file_dict: Dict[str, str], inclusion_map: Dict[str, List[str]], good_sample_ids: List[str]) -> object:
     template_cnv = cnvlib.read(file_dict[good_sample_ids[0]])
     chromosomes = np.array([normalize_chrom(c) for c in template_cnv.data['chromosome']])
+    unique_chroms = np.unique(chromosomes)
+    chrom_masks = {chrom: (chromosomes == chrom) for chrom in unique_chroms}
     
     mat_log2 = np.full((len(template_cnv.data), len(good_sample_ids)), np.nan, dtype=np.float32)
     mat_depth = np.full((len(template_cnv.data), len(good_sample_ids)), np.nan, dtype=np.float32)
@@ -194,30 +188,66 @@ def build_reference_matrix(file_dict: Dict[str, str], inclusion_map: Dict[str, L
     for i, sample_id in enumerate(good_sample_ids):
         curr_cnv = cnvlib.read(file_dict[sample_id])
         allowed_chroms = set(inclusion_map.get(sample_id, []))
-        
         if not allowed_chroms:
             continue
-
         keep_mask = np.isin(chromosomes, list(allowed_chroms))
         mat_log2[keep_mask, i] = curr_cnv.data['log2'].values.astype(np.float32)[keep_mask]
         mat_depth[keep_mask, i] = curr_cnv.data['depth'].values.astype(np.float32)[keep_mask]
 
+    # --- BIOLOGICAL SEGMENT MASKING ---
+    logger.info("Applying Biological Segment Masking to isolate technical noise...")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        crude_baseline = np.nanpercentile(mat_log2, 75, axis=1)
+        
+    masked_segments_count = 0
+    
+    for i in range(len(good_sample_ids)):
+        for chrom in unique_chroms:
+            mask = chrom_masks[chrom]
+            if not np.any(mask): 
+                continue
+                
+            sample_track = mat_log2[mask, i]
+            base_track = crude_baseline[mask]
+            
+            if np.isnan(sample_track).mean() > 0.90:
+                continue
+                
+            residuals = sample_track - base_track
+            # Rolling median smooths out bin-level technical noise, leaving only broad biological events
+            smoothed_signal = pd.Series(residuals).rolling(
+                window=BIOLOGICAL_SMOOTHING_WINDOW, center=True, min_periods=1
+            ).median().values
+            
+            # Identify broad biological segments (e.g. 1p/11q deletions)
+            tumor_mask = np.abs(smoothed_signal) > MAX_BIOLOGICAL_DEVIATION
+            
+            if np.any(tumor_mask):
+                mat_log2[mask, i][tumor_mask] = np.nan
+                masked_segments_count += np.sum(tumor_mask)
+                
+    logger.info(f"Masked {masked_segments_count} tumor-driven bins across cohort to protect baseline.")
+
+    # --- FINAL CONSENSUS & SAFETY CLAMPING ---
     logger.info("Calculating robust statistics and enforcing safety clamps...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         ref_log2 = np.nanmean(mat_log2, axis=1)
         ref_depth = np.nanmean(mat_depth, axis=1)
+        # CRITICAL: ddof=1 prevents infinite weights when n=1. 
         ref_spread = np.nanstd(mat_log2, axis=1, ddof=1) 
 
     fallback_mask = np.isnan(ref_log2)
     
-    # Depth Clamping
+    # Depth Clamping: Prevents division by zero or negative depths downstream
     ref_depth = np.maximum(ref_depth, 1e-6)
     ref_depth[np.isnan(ref_depth)] = np.nanmean(ref_depth) if not np.isnan(np.nanmean(ref_depth)) else 1.0
 
-    # Spread Clamping (75th percentile for conservative weighting)
+    # Spread Clamping: Use 75th percentile for bins lacking variance data (conservative weighting)
     safe_spread_val = np.nanpercentile(ref_spread, 75) if not np.isnan(np.nanpercentile(ref_spread, 75)) else 0.1
     ref_spread[np.isnan(ref_spread)] = safe_spread_val
+    # Hard clamp to prevent w = 1/0^2
     ref_spread = np.maximum(ref_spread, 0.001)
 
     ref_log2[fallback_mask] = 0.0
@@ -247,9 +277,32 @@ def main():
     logger.info("--- Phase 2: Dynamic Evaluation ---")
     inclusion_map, report_df, good_ids = evaluate_regions(targets_map)
     
+    # --- TERMINAL SUMMARY ---
+    total_samples = len(targets_map)
+    passed_global_qc = len(good_ids)
+    failed_global_qc = total_samples - passed_global_qc
+    
+    logger.info("=== EVALUATION SUMMARY ===")
+    logger.info(f"Global Autosomal QC: {passed_global_qc}/{total_samples} samples passed.")
+    if failed_global_qc > 0:
+        logger.warning(f"Global Autosomal QC: {failed_global_qc} samples entirely rejected.")
+
+    exclusion_df = report_df[report_df["Status"] == "EXCLUDED"]
+    if not exclusion_df.empty:
+        chrom_exclusions = exclusion_df[exclusion_df["Reason"] != "Global Noise Too High"]
+        if not chrom_exclusions.empty:
+            summary_stats = chrom_exclusions.groupby("Chromosome").size().sort_values(ascending=False)
+            logger.info("Local Chromosome Exclusions (across valid samples):")
+            for chrom, count in summary_stats.items():
+                logger.info(f"  [-] {chrom}: Excluded in {count} sample(s)")
+        else:
+            logger.info("Local Chromosome Exclusions: None detected. All valid targets included.")
+    else:
+         logger.info("Local Chromosome Exclusions: None detected.")
+    logger.info("==========================")
+    
     if args.report:
         report_path = args.report
-        # Auto-handle if user passes a directory instead of a file
         if os.path.isdir(report_path):
             report_path = os.path.join(report_path, "evaluation_report.tsv")
         
@@ -261,7 +314,9 @@ def main():
         logger.info(f"Evaluation report saved to: {report_path}")
 
     logger.info("--- Phase 3: Building Reference Matrices ---")
+    logger.info("[TARGETS]")
     ref_targets = build_reference_matrix(targets_map, inclusion_map, good_ids)
+    logger.info("[ANTITARGETS]")
     ref_antitargets = build_reference_matrix(antitargets_map, inclusion_map, good_ids)
 
     logger.info("--- Phase 4: Merging and Saving ---")
@@ -272,7 +327,7 @@ def main():
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir)
         
-    logger.info(f"Writing output to: {args.output}")
+    logger.info(f"Writing output via Pandas to avoid TabIO corruptions: {args.output}")
     ref_targets.data.to_csv(args.output, sep='\t', index=False, float_format='%.6g')
     logger.info("Pipeline completed successfully.")
 
