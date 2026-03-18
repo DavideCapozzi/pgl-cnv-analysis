@@ -68,10 +68,10 @@ generate_cohort_heatmaps() {
 
     # 2. PGL Specific Chromosomes
     log_info "Generating targeted heatmaps for PGL loci..."
-    for chr in chr1 chr3 chr7 chr11 chr17 chr22; do
-         cnvkit.py heatmap $clean_cns_list -d -c "$chr" --output "${VIZ_DIR}/cohort_heatmap_${chr}.pdf" \
-            && log_info "Heatmap for $chr created." \
-            || log_error "Failed to create heatmap for $chr."
+    for chr in $(seq 1 22); do
+    cnvkit.py heatmap $clean_cns_list -d -c "chr${chr}" --output "${VIZ_DIR}/cohort_heatmap_chr${chr}.pdf" \
+        && log_info "Heatmap for chr${chr} created." \
+        || log_error "Failed to create heatmap for chr${chr}."
     done
 }
 

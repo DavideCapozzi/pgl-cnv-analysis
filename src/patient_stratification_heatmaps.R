@@ -1,20 +1,20 @@
 # =============================================================================
-# CNVkit CNV Profile Analysis — ComplexHeatmap Edition (v5)
+# CNVkit CNV Profile Analysis — ComplexHeatmap Edition (v6)
 # =============================================================================
 # Two heatmaps are produced:
-#   1. Chromosome-arm-level heatmap for ARM_CHROMS, patients clustered by
+#   1. Whole-genome heatmap using per-chromosome-arm weighted median log2-ratio.
+#   2. Chromosome-arm-level heatmap for ARM_CHROMS, patients clustered by
 #      both arms simultaneously (ward.D2 / Euclidean on log2-ratio values).
-#   2. Whole-genome heatmap using per-chromosome weighted median log2-ratio.
 #
-# Changes from v4:
-#   - Colour scale is now data-driven and asymmetric around 0 (diploid = white).
+# Changes from v4/v5:
+#   - Heatmap 1 now also stratifies the entire genome by chromosome arms (p/q)
+#     using a complete set of hg38 centromere coordinates for all autosomes.
+#   - Colour scale is data-driven and asymmetric around 0 (diploid = white).
 #     Breakpoints are set at (p02, p10, 0, p90, p98) of the observed log2-ratio
 #     distribution, independently calibrated for deletion and gain arms.
 #     This approach mirrors GISTIC2 / cBioPortal conventions and maximises
 #     chromatic discrimination across the actual data range.
-#   - Legend ticks are the exact colorRamp2 breakpoints — no floating-point
-#     artefacts possible by construction.
-#   - Column split and ward.D2 clustering unchanged from v4.
+#   - Legend ticks are the exact colorRamp2 breakpoints.
 #
 # Input  : *_call.cns files inside sample sub-directories of OUT_DIR.
 #          Expected naming: <OUT_DIR>/<sample>/<sample>.call.cns
@@ -42,12 +42,29 @@ EXCLUDED_DIRS      <- c("visualizations", "multi_sample", "nfr", "nfrmulti_sampl
 
 ARM_CHROMS <- c("chr1", "chr3", "chr7", "chr11", "chr17", "chr22")
 
+# Expanded to cover all autosomes for whole-genome arm splitting (hg38)
 CENTROMERES_HG38 <- c(
   chr1  = 122026460,
+  chr2  =  92326171,
   chr3  =  90772459,
+  chr4  =  49660117,
+  chr5  =  46405641,
+  chr6  =  58830166,
   chr7  =  61053696,
+  chr8  =  43838887,
+  chr9  =  47367679,
+  chr10 =  39258202,
   chr11 =  51078349,
+  chr12 =  34856694,
+  chr13 =  16000000,
+  chr14 =  16000000,
+  chr15 =  17000000,
+  chr16 =  35335801,
   chr17 =  22813680,
+  chr18 =  15460696,
+  chr19 =  24681782,
+  chr20 =  25963282,
+  chr21 =  11288129,
   chr22 =  15979963
 )
 
@@ -151,18 +168,11 @@ run_diagnostics <- function(segs) {
     arrange(chrom_num)
   print(as.data.frame(chrom_summary))
   
-  # Asymmetric scale: calibrate deletion and gain arms independently.
-  # Breakpoints mirror GISTIC2 / cBioPortal conventions:
-  #   (p02, p10, 0, p90, p98) — 0 = diploid is always the central anchor.
-  # Values are rounded to 3 decimal places to avoid floating-point noise
-  # in colorRamp2 while preserving meaningful precision for the legend.
   p02 <- round(as.numeric(quantile(log2_vals, 0.02)), 3)
   p10 <- round(as.numeric(quantile(log2_vals, 0.10)), 3)
   p90 <- round(as.numeric(quantile(log2_vals, 0.90)), 3)
   p98 <- round(as.numeric(quantile(log2_vals, 0.98)), 3)
   
-  # Guard: if p10 >= 0 or p90 <= 0 (extremely skewed cohort), fall back to
-  # symmetric mid-points so colorRamp2 never receives non-monotone breaks.
   if (p10 >= 0) p10 <- round(p02 / 2, 3)
   if (p90 <= 0) p90 <- round(p98 / 2, 3)
   
@@ -212,37 +222,6 @@ run_diagnostics <- function(segs) {
 # 3.  MATRIX BUILDERS
 # =============================================================================
 
-build_genome_matrix <- function(segs) {
-  segs %>%
-    filter(grepl("^chr([1-9]|1[0-9]|2[012])$", chromosome),
-           is.finite(log2)) %>%
-    mutate(
-      chrom_num  = as.integer(sub("chr", "", chromosome)),
-      seg_length = end - start
-    ) %>%
-    filter(chrom_num >= 1, chrom_num <= 22) %>%
-    group_by(chromosome, chrom_num, sample_id) %>%
-    summarise(
-      wmed_log2 = {
-        o  <- order(log2)
-        wt <- seg_length[o]
-        cs <- cumsum(wt)
-        log2[o][which(cs >= sum(wt) / 2)[1]]
-      },
-      .groups = "drop"
-    ) %>%
-    pivot_wider(
-      id_cols     = c(chromosome, chrom_num),
-      names_from  = sample_id,
-      values_from = wmed_log2,
-      values_fill = 0
-    ) %>%
-    arrange(chrom_num) %>%
-    select(-chrom_num) %>%
-    column_to_rownames("chromosome") %>%
-    as.matrix()
-}
-
 assign_arm <- function(start_val, end_val, centromere) {
   if (end_val   <= centromere) return("p")
   if (start_val >= centromere) return("q")
@@ -251,6 +230,49 @@ assign_arm <- function(start_val, end_val, centromere) {
   if (p_len >= q_len) "p" else "q"
 }
 
+# Builds a whole-genome matrix stratified by p/q arms for all autosomes
+build_genome_arm_matrix <- function(segs) {
+  all_chroms <- paste0("chr", 1:22)
+  
+  arm_rows <- map_dfr(all_chroms, function(chrom) {
+    centromere <- CENTROMERES_HG38[[chrom]]
+    
+    segs %>%
+      filter(chromosome == chrom, is.finite(log2)) %>%
+      mutate(seg_length = end - start) %>%
+      rowwise() %>%
+      mutate(arm = assign_arm(start, end, centromere)) %>%
+      ungroup() %>%
+      group_by(arm, sample_id) %>%
+      summarise(
+        val_log2 = {
+          o  <- order(log2)
+          wt <- seg_length[o]
+          cs <- cumsum(wt)
+          log2[o][which(cs >= sum(wt) / 2)[1]]
+        },
+        .groups = "drop"
+      ) %>%
+      mutate(arm_label = paste0(chrom, arm))
+  })
+  
+  expected_arms <- unlist(lapply(all_chroms, function(ch) paste0(ch, c("p", "q"))))
+  
+  mat <- arm_rows %>%
+    pivot_wider(
+      id_cols     = arm_label,
+      names_from  = sample_id,
+      values_from = val_log2,
+      values_fill = 0
+    ) %>%
+    column_to_rownames("arm_label") %>%
+    as.matrix()
+  
+  row_order <- intersect(expected_arms, rownames(mat))
+  mat[row_order, , drop = FALSE]
+}
+
+# Builds the targeted matrix stratified by p/q arms for ARM_CHROMS
 build_arm_matrix <- function(segs) {
   arm_rows <- map_dfr(ARM_CHROMS, function(chrom) {
     centromere <- CENTROMERES_HG38[[chrom]]
@@ -286,13 +308,7 @@ build_arm_matrix <- function(segs) {
 }
 
 # =============================================================================
-# 4.  COLOUR SCALE  (asymmetric, data-driven, 0 = white anchor)
-#
-# Breakpoints: (p02, p10, 0, p90, p98) — calibrated independently for the
-# deletion and gain arms of the observed log2-ratio distribution.
-# This mirrors GISTIC2 / cBioPortal conventions and ensures full chromatic
-# range is used for both arms regardless of cohort-level asymmetry.
-# Legend ticks are the exact breakpoints — no floating-point artefacts.
+# 4.  COLOUR SCALE
 # =============================================================================
 
 make_log2_color_fun <- function(sp) {
@@ -328,16 +344,6 @@ ward_col_clust <- function(mat) {
   hclust(dist(t(mat), method = "euclidean"), method = "ward.D2")
 }
 
-# Determine the optimal integer k for column_split.
-#
-# When cluster_columns receives an hclust / dendrogram object, ComplexHeatmap
-# only accepts column_split as a *single integer* — not as a factor or vector.
-# The function therefore returns k as an integer scalar.
-#
-# Strategy: start from k_max = floor(n_samples * k_max_frac) and step down
-# until every cluster produced by cutree(hc, k) contains >= min_size samples.
-# This prevents visually distracting singleton columns while preserving the
-# hierarchical structure drawn by the dendrogram.
 derive_column_split <- function(hc, n_samples,
                                 min_size   = MIN_CLUSTER_SIZE,
                                 k_max_frac = 0.25) {
@@ -378,7 +384,7 @@ save_heatmap <- function(ht, filename, width_px = 1800, height_px = 950,
 }
 
 # =============================================================================
-# 7.  HEATMAP 1 — Whole-genome log2-ratio
+# 7.  HEATMAP 1 — Whole-genome log2-ratio (Arm Level)
 # =============================================================================
 
 plot_genome_heatmap <- function(mat, sp) {
@@ -386,24 +392,32 @@ plot_genome_heatmap <- function(mat, sp) {
   col_clust <- ward_col_clust(mat)
   col_split <- derive_column_split(col_clust, ncol(mat))
   
+  chrom_of_arm  <- sub("[pq]$", "", rownames(mat))
+  chrom_factor  <- factor(chrom_of_arm, levels = paste0("chr", 1:22))
+  compact_labels <- sub("chr", "", rownames(mat))
+  
   ht <- Heatmap(
     mat,
     name               = "log2 ratio",
     col                = col_fun,
     cluster_rows       = FALSE,
+    cluster_row_slices = FALSE,
     cluster_columns    = col_clust,
     column_split       = col_split,
     column_gap         = unit(3, "mm"),
     cluster_column_slices = FALSE,
+    row_split          = chrom_factor,
+    row_gap            = unit(1, "mm"),
     show_row_names     = TRUE,
+    row_labels         = compact_labels,
     show_column_names  = TRUE,
-    row_names_gp       = gpar(fontsize = 9),
+    row_names_gp       = gpar(fontsize = 8),
     column_names_gp    = gpar(fontsize = 7),
     column_names_rot   = 50,
-    column_title       = NULL,          # suppress per-slice titles
+    column_title       = NULL,          
     column_title_gp    = gpar(fontsize = 0),
-    row_title          = "Chromosome",
-    row_title_gp       = gpar(fontsize = 10, fontface = "bold"),
+    row_title_gp       = gpar(fontsize = 9, fontface = "bold"),
+    row_title_rot      = 0,
     border             = TRUE,
     border_gp          = gpar(col = "grey30", lwd = 0.8),
     rect_gp            = gpar(col = "grey90", lwd = 0.3),
@@ -411,15 +425,14 @@ plot_genome_heatmap <- function(mat, sp) {
     heatmap_legend_param = legend_params(sp)
   )
   
-  # Wrap in a titled layout to restore the main title above the dendrogram.
   out_path <- file.path(VIZ_DIR, "cnv_genome_heatmap.png")
-  png(out_path, width = 1800, height = 950, res = 150, bg = "white")
+  png(out_path, width = 1800, height = 1100, res = 150, bg = "white")
   draw(ht,
        heatmap_legend_side    = "right",
        annotation_legend_side = "right",
        merge_legends          = FALSE,
        padding                = unit(c(8, 8, 8, 8), "mm"),
-       column_title = "Whole-Genome CNV Profile  \u2014  Weighted Median log2-Ratio per Chromosome",
+       column_title = "Whole-Genome CNV Profile  \u2014  Weighted Median log2-Ratio per Chromosome Arm",
        column_title_gp = gpar(fontsize = 12, fontface = "bold"))
   dev.off()
   message("  [SAVED] ", out_path)
@@ -488,7 +501,7 @@ plot_arm_heatmap <- function(mat, sp) {
 
 main <- function() {
   message("\n", strrep("=", 70))
-  message("CNVkit — ComplexHeatmap CNV Analysis  (v4, log2-ratio)")
+  message("CNVkit — ComplexHeatmap CNV Analysis  (v6, log2-ratio)")
   message(strrep("=", 70))
   
   message("\n[1/5] Importing CNV segments ...")
@@ -504,9 +517,9 @@ main <- function() {
   
   message("\n[3/5] Building log2-ratio matrices ...")
   
-  genome_mat <- build_genome_matrix(segs)
+  genome_mat <- build_genome_arm_matrix(segs)
   message("  Genome matrix : ",
-          nrow(genome_mat), " chromosomes x ", ncol(genome_mat), " samples")
+          nrow(genome_mat), " arms x ", ncol(genome_mat), " samples")
   message("  log2 range    : [",
           round(min(genome_mat), 3), ", ", round(max(genome_mat), 3), "]")
   
@@ -516,10 +529,10 @@ main <- function() {
   message("  log2 range    : [",
           round(min(arm_mat), 3), ", ", round(max(arm_mat), 3), "]")
   
-  message("\n[4/5] Plotting whole-genome heatmap ...")
+  message("\n[4/5] Plotting whole-genome arm heatmap ...")
   plot_genome_heatmap(genome_mat, sp)
   
-  message("\n[5/5] Plotting chromosome-arm heatmap ...")
+  message("\n[5/5] Plotting targeted chromosome-arm heatmap ...")
   plot_arm_heatmap(arm_mat, sp)
   
   message("\n", strrep("=", 70))
