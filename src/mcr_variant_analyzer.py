@@ -295,6 +295,14 @@ Example usage:
     args = parser.parse_args()
     
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # Dynamically add file handler to the logger to save logs in the results folder
+    log_file_path = os.path.join(args.out_dir, "mcr_analysis_run.log")
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logger.addHandler(file_handler)
+    logger.info(f"Initialized file logging at: {log_file_path}")
+
     target_chroms = [normalize_chrom(c.strip()) for c in args.chromosomes.split(",")]
     
     logger.info("--- Phase 1: File Mapping ---")
@@ -347,15 +355,18 @@ Example usage:
     logger.info("--- Phase 4: Report Generation ---")
     
     df_mcr = pd.DataFrame(mcr_records)
-    out_mcr_path = os.path.join(args.out_dir, "mcr_regions_summary.tsv")
-    df_mcr.to_csv(out_mcr_path, sep='\t', index=False)
+    out_mcr_path = os.path.join(args.out_dir, "mcr_regions_summary.xlsx")
+    df_mcr.to_excel(out_mcr_path, index=False, engine='openpyxl')
     logger.info(f"[+] Saved MCR regions to: {out_mcr_path}")
     
     if variant_records:
         df_var = pd.DataFrame(variant_records)
-        out_var_path = os.path.join(args.out_dir, "mcr_patient_variants.tsv")
-        df_var.to_csv(out_var_path, sep='\t', index=False)
-        logger.info(f"[+] Saved {len(variant_records)} variant annotations to: {out_var_path}")
+        out_var_path = os.path.join(args.out_dir, "mcr_patient_variants.xlsx")
+        try:
+            df_var.to_excel(out_var_path, index=False, engine='openpyxl')
+            logger.info(f"[+] Saved {len(variant_records)} variant annotations to: {out_var_path}")
+        except Exception as e:
+            logger.error(f"Failed to save variants to Excel (possibly exceeded 1M rows). Error: {e}")
     else:
         logger.info("[-] No variants found within the detected MCRs for the involved patients.")
         
