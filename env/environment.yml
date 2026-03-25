@@ -39,6 +39,7 @@ dependencies:
   - pip
   - wget
   - openpyxl
+  - requests
 
   # =======================================================
   # PIP
