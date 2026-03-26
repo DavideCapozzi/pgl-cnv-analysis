@@ -42,6 +42,8 @@ EXCLUDED_DIRS      <- c("visualizations", "multi_sample", "nfr", "nfrmulti_sampl
 
 ARM_CHROMS <- c("chr1", "chr3", "chr7", "chr11", "chr17", "chr22")
 
+META_FILE <- file.path(OUT_DIR, "cohort_metadata.tsv")
+
 # Expanded to cover all autosomes for whole-genome arm splitting (hg38)
 CENTROMERES_HG38 <- c(
   chr1  = 122026460,
@@ -337,6 +339,62 @@ legend_params <- function(sp) {
 }
 
 # =============================================================================
+# 4.5. CLINICAL METADATA ANNOTATION
+# =============================================================================
+
+build_clinical_annotation <- function(mat, meta_path) {
+  if (!file.exists(meta_path)) {
+    return(NULL)
+  }
+  
+  meta_df <- read_tsv(meta_path, show_col_types = FALSE)
+  target_samples <- colnames(mat)
+  meta_aligned <- meta_df[match(target_samples, meta_df$sample_id), ]
+  
+  meta_aligned$sex[is.na(meta_aligned$sex)] <- "Unknown"
+  meta_aligned$tumor_location[is.na(meta_aligned$tumor_location)] <- "Unknown"
+  
+  # High-contrast clinical palette (Teal & Purple) orthogonal to RdBu heatmap
+  sex_colors <- c(
+    "Male"         = "#008080", # Teal
+    "Female"       = "#800080", # Purple
+    "Female_LOH_X" = "#BA55D3", # Medium Orchid
+    "Unknown"      = "#BDBDBD", # Light Grey
+    "Error"        = "#000000"  # Black
+  )
+  
+  # Custom safe palette avoiding Teal, Purple, Blue, and Deep Red
+  base_loc_colors <- c(
+    "#FF7F00", # Orange
+    "#4DAF4A", # Grass Green (Pure green, no blue tint)
+    "#E7298A", # Magenta
+    "#E6AB02", # Mustard Gold
+    "#A65628", # Saddle Brown
+    "#B2DF8A", # Light Green
+    "#FB9A99"  # Soft Coral
+  )
+  
+  unique_locs <- unique(meta_aligned$tumor_location)
+  num_locs <- length(unique_locs)
+  
+  if (num_locs <= length(base_loc_colors)) {
+    loc_palette <- base_loc_colors[1:num_locs]
+  } else {
+    loc_palette <- colorRampPalette(base_loc_colors)(num_locs)
+  }
+  
+  loc_colors <- setNames(loc_palette, unique_locs)
+  
+  HeatmapAnnotation(
+    Sex      = meta_aligned$sex,
+    Location = meta_aligned$tumor_location,
+    col      = list(Sex = sex_colors, Location = loc_colors),
+    annotation_name_gp = gpar(fontsize = 9, fontface = "bold"),
+    simple_anno_size   = unit(4, "mm"),
+    show_legend        = c(TRUE, TRUE)
+  )
+}
+# =============================================================================
 # 5.  CLUSTERING  +  COLUMN SPLIT
 # =============================================================================
 
@@ -392,11 +450,13 @@ plot_genome_heatmap <- function(mat, sp) {
   col_clust <- ward_col_clust(mat)
   col_split <- derive_column_split(col_clust, ncol(mat))
   
+  top_anno <- build_clinical_annotation(mat, META_FILE)
+  
   chrom_of_arm  <- sub("[pq]$", "", rownames(mat))
   chrom_factor  <- factor(chrom_of_arm, levels = paste0("chr", 1:22))
   compact_labels <- sub("chr", "", rownames(mat))
   
-  ht <- Heatmap(
+  ht_args <- list(
     mat,
     name               = "log2 ratio",
     col                = col_fun,
@@ -425,6 +485,12 @@ plot_genome_heatmap <- function(mat, sp) {
     heatmap_legend_param = legend_params(sp)
   )
   
+  if (!is.null(top_anno)) {
+    ht_args$top_annotation <- top_anno
+  }
+  
+  ht <- do.call(Heatmap, ht_args)
+  
   out_path <- file.path(VIZ_DIR, "cnv_genome_heatmap.png")
   png(out_path, width = 1800, height = 1100, res = 150, bg = "white")
   draw(ht,
@@ -447,11 +513,13 @@ plot_arm_heatmap <- function(mat, sp) {
   col_clust <- ward_col_clust(mat)
   col_split <- derive_column_split(col_clust, ncol(mat))
   
+  top_anno <- build_clinical_annotation(mat, META_FILE)
+  
   chrom_of_arm  <- sub("[pq]$", "", rownames(mat))
   chrom_factor  <- factor(chrom_of_arm, levels = ARM_CHROMS)
   compact_labels <- sub("chr", "", rownames(mat))
   
-  ht <- Heatmap(
+  ht_args <- list(
     mat,
     name               = "log2 ratio",
     col                = col_fun,
@@ -479,6 +547,12 @@ plot_arm_heatmap <- function(mat, sp) {
     heatmap_legend_param = legend_params(sp)
   )
   
+  if (!is.null(top_anno)) {
+    ht_args$top_annotation <- top_anno
+  }
+  
+  ht <- do.call(Heatmap, ht_args)
+  
   out_path <- file.path(VIZ_DIR, "cnv_arm_heatmap.png")
   png(out_path, width = 1600, height = 900, res = 150, bg = "white")
   draw(ht,
@@ -496,48 +570,35 @@ plot_arm_heatmap <- function(mat, sp) {
 }
 
 # =============================================================================
-# 9.  MAIN
+# 9.  ORCHESTRATOR / MAIN EXECUTION
 # =============================================================================
 
 main <- function() {
-  message("\n", strrep("=", 70))
-  message("CNVkit — ComplexHeatmap CNV Analysis  (v6, log2-ratio)")
-  message(strrep("=", 70))
+  message("=== Starting CNV Profile Analysis Pipeline ===")
   
-  message("\n[1/5] Importing CNV segments ...")
+  # 1. Import Data
   segs <- import_segments()
+  if (is.null(segs) || nrow(segs) == 0) {
+    stop("Execution halted: No valid segments imported.")
+  }
   
-  if (is.null(segs) || nrow(segs) == 0) stop("No segment data imported.")
-  
-  n_samples <- length(unique(segs$sample_id))
-  message("  Imported ", nrow(segs), " segments from ", n_samples, " sample(s).")
-  
-  message("\n[2/5] Running diagnostics ...")
+  # 2. Diagnostics & Color Mapping
   sp <- run_diagnostics(segs)
   
-  message("\n[3/5] Building log2-ratio matrices ...")
+  # 3. Whole Genome Heatmap
+  message("Building whole-genome matrix...")
+  mat_genome <- build_genome_arm_matrix(segs)
+  message("Plotting whole-genome heatmap...")
+  plot_genome_heatmap(mat_genome, sp)
   
-  genome_mat <- build_genome_arm_matrix(segs)
-  message("  Genome matrix : ",
-          nrow(genome_mat), " arms x ", ncol(genome_mat), " samples")
-  message("  log2 range    : [",
-          round(min(genome_mat), 3), ", ", round(max(genome_mat), 3), "]")
+  # 4. Chromosome-Arm Targeted Heatmap
+  message("\nBuilding targeted arm matrix...")
+  mat_arm <- build_arm_matrix(segs)
+  message("Plotting targeted arm heatmap...")
+  plot_arm_heatmap(mat_arm, sp)
   
-  arm_mat <- build_arm_matrix(segs)
-  message("  Arm matrix    : ",
-          nrow(arm_mat), " arms x ", ncol(arm_mat), " samples")
-  message("  log2 range    : [",
-          round(min(arm_mat), 3), ", ", round(max(arm_mat), 3), "]")
-  
-  message("\n[4/5] Plotting whole-genome arm heatmap ...")
-  plot_genome_heatmap(genome_mat, sp)
-  
-  message("\n[5/5] Plotting targeted chromosome-arm heatmap ...")
-  plot_arm_heatmap(arm_mat, sp)
-  
-  message("\n", strrep("=", 70))
-  message("Done. Output in: ", VIZ_DIR)
-  message(strrep("=", 70), "\n")
+  message("\n=== Pipeline Execution Completed Successfully ===")
 }
 
+# Execute the script
 main()
