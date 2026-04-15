@@ -280,38 +280,57 @@ def extract_variants_in_mcr(mcr: Dict, sample_map: Dict, mcr_id: str, min_dp: in
             
         try:
             vcf = pysam.VariantFile(vcf_path)
-            records = vcf.fetch(mcr['chrom'], mcr['start'], mcr['end'])
+            
+            # Dynamically resolve contig naming mismatch between CNVkit (chr) and VCF
+            query_chrom = mcr['chrom']
+            if query_chrom not in vcf.header.contigs:
+                alt_chrom = query_chrom.replace("chr", "")
+                if alt_chrom in vcf.header.contigs:
+                    query_chrom = alt_chrom
+                    
+            records = vcf.fetch(query_chrom, mcr['start'], mcr['end'])
             for rec in records:
                 var_dict = _parse_vcf_record(rec, sample, mcr_id, mcr['chrom'], min_dp, min_af)
                 if var_dict: variants_found.append(var_dict)
-        except Exception:
+        except ValueError:
+            # Fallback for unindexed VCFs, applying contig normalization
             try:
                 vcf.reset()
+                alt_chrom_fb = mcr['chrom'].replace("chr", "")
                 for rec in vcf:
-                    if rec.chrom == mcr['chrom'] and mcr['start'] <= rec.pos <= mcr['end']:
+                    if rec.chrom in [mcr['chrom'], alt_chrom_fb] and mcr['start'] <= rec.pos <= mcr['end']:
                         var_dict = _parse_vcf_record(rec, sample, mcr_id, mcr['chrom'], min_dp, min_af)
                         if var_dict: variants_found.append(var_dict)
-            except Exception:
-                pass
+            except Exception as inner_e:
+                logger.warning(f"Failed linear scan for {sample} in {mcr_id}: {inner_e}")
+        except Exception as e:
+            logger.warning(f"Failed to process VCF for {sample}: {e}")
         finally:
             vcf.close()
         
     return variants_found
 
 def _parse_vcf_record(rec: pysam.VariantRecord, sample: str, mcr_id: str, chrom: str, min_dp: int, min_af: float) -> Dict:
-    dp_val, af_val = 0, 0.0
+    dp_val, max_af_val = 0, 0.0
     if rec.samples:
         sample_data = rec.samples[0] 
         dp_val = sample_data.get('DP', 0) or 0
         af_raw = sample_data.get('AF', 0.0)
-        af_val = af_raw[0] if isinstance(af_raw, tuple) and af_raw else (af_raw or 0.0)
+        
+        # Robust handling for multiallelic variants (tuple) to avoid missing driver mutations
+        if isinstance(af_raw, tuple) and af_raw:
+            valid_afs = [float(v) for v in af_raw if v is not None]
+            max_af_val = max(valid_afs) if valid_afs else 0.0
+        else:
+            max_af_val = float(af_raw) if af_raw is not None else 0.0
             
-    if dp_val < min_dp or af_val < min_af: return {}
+    if dp_val < min_dp or max_af_val < min_af: return {}
+    
     return {
         'MCR_ID': mcr_id, 'Sample': sample, 'Chromosome': chrom,
         'Position': rec.pos, 'Ref': rec.ref, 'Alt': ",".join(rec.alts) if rec.alts else ".",
         'Filter': ";".join(rec.filter.keys()) if rec.filter.keys() else "PASS",
-        'Depth': dp_val, 'Allele_Freq': round(af_val, 4)
+        'Depth': dp_val, 'Allele_Freq': round(max_af_val, 4)
     }
 
 # =============================================================================

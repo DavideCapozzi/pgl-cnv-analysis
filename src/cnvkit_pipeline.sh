@@ -30,7 +30,7 @@ log_error() { echo -e "[ERROR] $(date '+%H:%M:%S') - $1" >&2; }
 get_vcf_from_list() {
     local sample_name="$1"
     local vcf_list="$2"
-    grep "${sample_name}" "$vcf_list" | head -n 1
+    grep -w "${sample_name}" "$vcf_list" | head -n 1
 }
 
 # =====================================================================
