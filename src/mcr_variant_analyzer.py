@@ -7,6 +7,7 @@ CNVkit Minimal Common Region (MCR) & Variant Analyzer (hg38 Edition)
 Purpose: Identifies overlapping genomic regions (MCRs) of concordant copy number 
 alterations across multiple patients, extracts variants, and maps genes.
 Excludes centromeric regions (hg38) to reduce mapping artifacts.
+Includes dynamic contig resolution and length-weighted Log2 evaluation.
 """
 
 import os
@@ -35,7 +36,6 @@ logger = logging.getLogger("MCR_Analyzer")
 # =============================================================================
 # HG38 CENTROMERE COORDINATES (NCBI GRC)
 # =============================================================================
-# Coordinates mapping based on GRCh38.p14 patches.
 HG38_CENTROMERES = {
     'chr1': (122026460, 125184587),
     'chr2': (92188146, 94090557),
@@ -66,7 +66,6 @@ HG38_CENTROMERES = {
 # =============================================================================
 # UTILITIES & I/O
 # =============================================================================
-
 def normalize_chrom(name: str) -> str:
     s = str(name).strip()
     return s if s.startswith("chr") else f"chr{s}"
@@ -112,7 +111,6 @@ def map_sample_files(cnv_dir: str, vcf_dir: str) -> Dict[str, Dict[str, str]]:
 # =============================================================================
 # API GENE ANNOTATION (ENSEMBL REST)
 # =============================================================================
-
 def fetch_genes_for_region(chrom: str, start: int, end: int) -> str:
     clean_chrom = chrom.replace("chr", "")
     max_chunk = 4000000 
@@ -145,12 +143,7 @@ def fetch_genes_for_region(chrom: str, start: int, end: int) -> str:
 # =============================================================================
 # CORE INTERVAL LOGIC & CENTROMERE FILTERING
 # =============================================================================
-
 def filter_centromeres(segments: List[Dict]) -> List[Dict]:
-    """
-    Substracts hg38 centromere coordinates from patient segments.
-    Splits segments into two if they span across the entire centromere.
-    """
     filtered = []
     for seg in segments:
         chrom = seg['chrom']
@@ -182,7 +175,6 @@ def filter_centromeres(segments: List[Dict]) -> List[Dict]:
             seg2['start'] = cen_end + 1
             filtered.append(seg2)
             
-    # Protect against any invalid zero/negative length segments
     return [s for s in filtered if s['start'] <= s['end']]
 
 def parse_and_merge_cnv(file_path: str, sample_id: str, chroms: List[str], min_log2: float) -> Tuple[List[Dict], List[Dict]]:
@@ -192,11 +184,14 @@ def parse_and_merge_cnv(file_path: str, sample_id: str, chroms: List[str], min_l
         logger.error(f"Failed to read {file_path}: {e}")
         return [], []
 
+    if 'chromosome' not in df.columns: return [], []
     df['chromosome'] = df['chromosome'].apply(normalize_chrom)
     df = df[df['chromosome'].isin(chroms)]
     
     if 'log2' in df.columns:
         df = df[df['log2'].abs() >= min_log2]
+    else:
+        df['log2'] = 0.0
     
     amps = df[df['cn'] > 2].copy()
     dels = df[df['cn'] < 2].copy()
@@ -205,20 +200,43 @@ def parse_and_merge_cnv(file_path: str, sample_id: str, chroms: List[str], min_l
         if sub_df.empty: return []
         sub_df = sub_df.sort_values(by=['chromosome', 'start'])
         merged = []
+        
         for _, row in sub_df.iterrows():
+            seg_len = max(1, row['end'] - row['start'])
             if not merged:
-                merged.append({'chrom': row['chromosome'], 'start': row['start'], 'end': row['end'], 'sample': sample_id, 'type': alt_type})
+                merged.append({
+                    'chrom': row['chromosome'], 'start': row['start'], 'end': row['end'], 
+                    'sample': sample_id, 'type': alt_type, 
+                    'log2_vals': [row['log2']], 'lens': [seg_len]
+                })
             else:
                 last = merged[-1]
                 if row['chromosome'] == last['chrom'] and row['start'] <= last['end'] + 1:
                     last['end'] = max(last['end'], row['end'])
+                    last['log2_vals'].append(row['log2'])
+                    last['lens'].append(seg_len)
                 else:
-                    merged.append({'chrom': row['chromosome'], 'start': row['start'], 'end': row['end'], 'sample': sample_id, 'type': alt_type})
-        return merged
+                    merged.append({
+                        'chrom': row['chromosome'], 'start': row['start'], 'end': row['end'], 
+                        'sample': sample_id, 'type': alt_type, 
+                        'log2_vals': [row['log2']], 'lens': [seg_len]
+                    })
+                    
+        # Calculate length-weighted log2 mean
+        final_merged = []
+        for m in merged:
+            total_len = sum(m['lens'])
+            weighted_log2 = sum(l * w for l, w in zip(m['log2_vals'], m['lens'])) / total_len if total_len else 0
+            final_merged.append({
+                'chrom': m['chrom'], 'start': m['start'], 'end': m['end'],
+                'sample': m['sample'], 'type': m['type'], 'log2': round(weighted_log2, 4)
+            })
+            
+        return final_merged
 
     return merge_segments(amps, 'AMP'), merge_segments(dels, 'DEL')
 
-def sweep_line_mcr(segments: List[Dict], min_patients: int) -> List[Dict]:
+def sweep_line_mcr(segments: List[Dict], min_patients: int, min_length_bp: int) -> List[Dict]:
     if not segments: return []
         
     mcrs = []
@@ -229,47 +247,57 @@ def sweep_line_mcr(segments: List[Dict], min_patients: int) -> List[Dict]:
     for chrom, chrom_segments in chrom_groups.items():
         events = []
         for seg in chrom_segments:
-            events.append((seg['start'], 'start', seg['sample']))
-            events.append((seg['end'], 'end', seg['sample']))
+            events.append((seg['start'], 'start', seg['sample'], seg['log2']))
+            events.append((seg['end'], 'end', seg['sample'], seg['log2']))
             
         events.sort(key=lambda x: (x[0], 0 if x[1] == 'start' else 1))
         
         active_samples: Set[str] = set()
+        active_log2: Dict[str, float] = {}
+        
         cumulative_samples: Set[str] = set()
+        cumulative_log2: Dict[str, float] = {}
         current_mcr_start = None
         
-        for pos, event_type, sample in events:
+        for pos, event_type, sample, log2 in events:
             if event_type == 'start':
                 active_samples.add(sample)
+                active_log2[sample] = log2
                 if current_mcr_start is not None:
                     cumulative_samples.add(sample)
+                    cumulative_log2[sample] = log2
             else:
                 active_samples.discard(sample)
+                if sample in active_log2: del active_log2[sample]
                 
             current_count = len(active_samples)
             
             if current_count >= min_patients and current_mcr_start is None:
                 current_mcr_start = pos
                 cumulative_samples = set(active_samples)
+                cumulative_log2 = {s: active_log2[s] for s in active_samples}
                 
             elif current_count < min_patients and current_mcr_start is not None:
-                if pos > current_mcr_start:
+                mcr_len = pos - current_mcr_start
+                if mcr_len >= min_length_bp:
+                    mean_log2 = sum(cumulative_log2.values()) / len(cumulative_log2) if cumulative_log2 else 0.0
                     mcrs.append({
                         'chrom': chrom,
                         'start': current_mcr_start,
                         'end': pos,
                         'n_patients': len(cumulative_samples),
-                        'patients': ",".join(sorted(list(cumulative_samples)))
+                        'patients': ",".join(sorted(list(cumulative_samples))),
+                        'mean_log2': round(mean_log2, 4)
                     })
                 current_mcr_start = None
                 cumulative_samples = set()
+                cumulative_log2 = {}
                 
     return mcrs
 
 # =============================================================================
 # VARIANT EXTRACTION & FILTERING
 # =============================================================================
-
 def extract_variants_in_mcr(mcr: Dict, sample_map: Dict, mcr_id: str, min_dp: int, min_af: float) -> List[Dict]:
     involved_samples = mcr['patients'].split(",")
     variants_found = []
@@ -292,6 +320,7 @@ def extract_variants_in_mcr(mcr: Dict, sample_map: Dict, mcr_id: str, min_dp: in
             for rec in records:
                 var_dict = _parse_vcf_record(rec, sample, mcr_id, mcr['chrom'], min_dp, min_af)
                 if var_dict: variants_found.append(var_dict)
+                
         except ValueError:
             # Fallback for unindexed VCFs, applying contig normalization
             try:
@@ -306,7 +335,7 @@ def extract_variants_in_mcr(mcr: Dict, sample_map: Dict, mcr_id: str, min_dp: in
         except Exception as e:
             logger.warning(f"Failed to process VCF for {sample}: {e}")
         finally:
-            vcf.close()
+            if 'vcf' in locals(): vcf.close()
         
     return variants_found
 
@@ -317,7 +346,7 @@ def _parse_vcf_record(rec: pysam.VariantRecord, sample: str, mcr_id: str, chrom:
         dp_val = sample_data.get('DP', 0) or 0
         af_raw = sample_data.get('AF', 0.0)
         
-        # Robust handling for multiallelic variants (tuple) to avoid missing driver mutations
+        # Robust handling for multiallelic variants
         if isinstance(af_raw, tuple) and af_raw:
             valid_afs = [float(v) for v in af_raw if v is not None]
             max_af_val = max(valid_afs) if valid_afs else 0.0
@@ -336,12 +365,9 @@ def _parse_vcf_record(rec: pysam.VariantRecord, sample: str, mcr_id: str, chrom:
 # =============================================================================
 # REPORTING & VISUALIZATION
 # =============================================================================
-
 def generate_mcr_barplot(df_mcr: pd.DataFrame, out_dir: str):
-    """Generates a bar plot representing patient counts for each MCR ordered by genome."""
     if df_mcr.empty: return
     
-    # Create an internal numeric key for perfect sorting along the genome
     df_plot = df_mcr.copy()
     df_plot['chrom_num'] = df_plot['Chromosome'].str.replace('chr', '').replace({'X': 23, 'Y': 24, 'M': 25, 'MT': 25}).astype(int)
     df_plot = df_plot.sort_values(['chrom_num', 'Start_MB'])
@@ -358,7 +384,6 @@ def generate_mcr_barplot(df_mcr: pd.DataFrame, out_dir: str):
     plt.title('MCR Patient Involvement across hg38 Genome', fontsize=14)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Legend handling
     from matplotlib.patches import Patch
     legend_elements = [Patch(facecolor='#d62728', label='Amplification (AMP)'),
                        Patch(facecolor='#1f77b4', label='Deletion (DEL)')]
@@ -373,7 +398,6 @@ def generate_mcr_barplot(df_mcr: pd.DataFrame, out_dir: str):
 # =============================================================================
 # MAIN ORCHESTRATOR
 # =============================================================================
-
 def main():
     parser = argparse.ArgumentParser(description="Extracts MCRs (Centromere excluded), maps genes, and filters variants.")
     parser.add_argument("--cnv-dir", required=True, help="Recursive root directory containing *.call.cns files.")
@@ -382,6 +406,7 @@ def main():
     parser.add_argument("--chromosomes", required=True, help="Comma-separated list of chromosomes (e.g., 1,2,3).")
     parser.add_argument("--min-patients", type=int, default=3, help="Min samples to form an MCR (default: 3).")
     parser.add_argument("--min-log2", type=float, default=0.25, help="Min absolute log2 ratio (default: 0.25).")
+    parser.add_argument("--min-mcr-kb", type=float, default=10.0, help="Min length in KB for an MCR to be valid (default: 10.0).")
     parser.add_argument("--min-dp", type=int, default=20, help="Min Depth (DP) for variant (default: 20).")
     parser.add_argument("--min-af", type=float, default=0.05, help="Min Allele Frequency (AF) for variant (default: 0.05).")
     parser.add_argument("--annotate-genes", action="store_true", help="Enable Ensembl API querying.")
@@ -399,6 +424,7 @@ def main():
     logger.addHandler(file_handler)
     
     target_chroms = [normalize_chrom(c.strip()) for c in args.chromosomes.split(",")]
+    min_length_bp = int(args.min_mcr_kb * 1000)
     
     logger.info("--- Phase 1: File Mapping ---")
     sample_map = map_sample_files(args.cnv_dir, args.vcf_dir)
@@ -406,7 +432,7 @@ def main():
         logger.error("No valid CNV files found. Exiting.")
         return
 
-    logger.info(f"--- Phase 2: Interval Parsing, Centromere Filtering & MCR Detection ({args.min_patients}+ patients) ---")
+    logger.info(f"--- Phase 2: Interval Parsing & MCR Detection ({args.min_patients}+ patients, >= {args.min_mcr_kb} KB) ---")
     all_amps, all_dels = [], []
     
     for sample, paths in sample_map.items():
@@ -414,12 +440,11 @@ def main():
         all_amps.extend(amps)
         all_dels.extend(dels)
         
-    # Apply Centromere Filter before Sweep-line
     all_amps = filter_centromeres(all_amps)
     all_dels = filter_centromeres(all_dels)
         
-    mcr_amps = sweep_line_mcr(all_amps, args.min_patients)
-    mcr_dels = sweep_line_mcr(all_dels, args.min_patients)
+    mcr_amps = sweep_line_mcr(all_amps, args.min_patients, min_length_bp)
+    mcr_dels = sweep_line_mcr(all_dels, args.min_patients, min_length_bp)
     
     for m in mcr_amps: m['type'] = 'AMP'
     for m in mcr_dels: m['type'] = 'DEL'
@@ -442,8 +467,9 @@ def main():
             'Chromosome': mcr['chrom'],
             'Start_MB': round(mcr['start'] / 1_000_000.0, 6),
             'End_MB': round(mcr['end'] / 1_000_000.0, 6),
-            'Length_MB': round((mcr['end'] - mcr['start']) / 1_000_000.0, 6),
+            'Length_KB': round((mcr['end'] - mcr['start']) / 1000.0, 3),
             'Type': mcr['type'],
+            'Mean_Log2': mcr['mean_log2'],
             'N_Patients': mcr['n_patients'],
             'Patient_IDs': mcr['patients'],
             'Gene_Symbols': annotated_genes
@@ -457,7 +483,6 @@ def main():
     df_mcr.to_excel(out_mcr_path, index=False, engine='openpyxl')
     logger.info(f"[+] Saved MCR regions to: {out_mcr_path}")
     
-    # Generate Plot
     generate_mcr_barplot(df_mcr, args.out_dir)
     
     if variant_records:
