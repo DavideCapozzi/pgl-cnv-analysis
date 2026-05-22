@@ -28,13 +28,14 @@ suppressPackageStartupMessages({
   library(circlize)
   library(RColorBrewer)
   library(grid)
+  library(readxl)
 })
 
 # =============================================================================
 # CONFIGURATION — edit only this block
 # =============================================================================
 
-OUT_DIR <- "D:/CNVkit/tumor/tumor_newout/dynamic_flat_reference_output"
+OUT_DIR <- "/mnt/d/CNVkit/tumor/tumor_newout/dynamic_flat_reference_output"
 VIZ_DIR <- file.path(OUT_DIR, "visualizations")
 
 SAMPLE_DIR_PATTERN <- "-t"
@@ -42,7 +43,8 @@ EXCLUDED_DIRS      <- c("visualizations", "multi_sample", "nfr", "nfrmulti_sampl
 
 ARM_CHROMS <- c("chr1", "chr3", "chr7", "chr11", "chr17", "chr22")
 
-META_FILE <- file.path(OUT_DIR, "cohort_metadata.tsv")
+META_FILE      <- file.path(OUT_DIR, "cohort_metadata.tsv")
+CLINICAL_FILE  <- "/home/davidec/projects/pgl-cnv-analysis/results/clinca WES PGL.xlsx"
 
 # Expanded to cover all autosomes for whole-genome arm splitting (hg38)
 CENTROMERES_HG38 <- c(
@@ -394,6 +396,71 @@ build_clinical_annotation <- function(mat, meta_path) {
     show_legend        = c(TRUE, TRUE)
   )
 }
+# Extends build_clinical_annotation with SDHB IHC + germline variant tracks
+build_extended_annotation <- function(mat, meta_path, clinical_path) {
+  if (!file.exists(meta_path) || !file.exists(clinical_path)) {
+    return(build_clinical_annotation(mat, meta_path))
+  }
+
+  meta_df <- read_tsv(meta_path, show_col_types = FALSE)
+  clin_df <- read_excel(clinical_path)
+  colnames(clin_df) <- c("sample_base", "sdhb_ihc", "germline_variant")
+
+  # Strip "-t" suffix to join with Excel IDs (PTJ62-t → PTJ62)
+  target_samples <- colnames(mat)
+  base_ids       <- sub("-t$", "", target_samples)
+
+  meta_aligned <- meta_df[match(target_samples, meta_df$sample_id), ]
+  meta_aligned$sex[is.na(meta_aligned$sex)]                     <- "Unknown"
+  meta_aligned$tumor_location[is.na(meta_aligned$tumor_location)] <- "Unknown"
+
+  clin_aligned <- clin_df[match(base_ids, clin_df$sample_base), ]
+  sdhb_vals    <- ifelse(is.na(clin_aligned$sdhb_ihc),
+                         "Unknown",
+                         as.character(clin_aligned$sdhb_ihc))
+
+  sex_colors <- c(
+    "Male"         = "#008080",
+    "Female"       = "#800080",
+    "Female_LOH_X" = "#BA55D3",
+    "Unknown"      = "#BDBDBD",
+    "Error"        = "#000000"
+  )
+
+  base_loc_colors <- c(
+    "#FF7F00", "#4DAF4A", "#E7298A", "#E6AB02",
+    "#A65628", "#B2DF8A", "#FB9A99"
+  )
+  unique_locs <- unique(meta_aligned$tumor_location)
+  num_locs    <- length(unique_locs)
+  loc_palette <- if (num_locs <= length(base_loc_colors)) {
+    base_loc_colors[1:num_locs]
+  } else {
+    colorRampPalette(base_loc_colors)(num_locs)
+  }
+  loc_colors <- setNames(loc_palette, unique_locs)
+
+  sdhb_colors <- c(
+    "pos"     = "#D62728",  # Red — SDHB loss detected
+    "neg"     = "#1F77B4",  # Blue — SDHB intact
+    "Unknown" = "#BDBDBD"
+  )
+
+  HeatmapAnnotation(
+    Sex      = meta_aligned$sex,
+    Location = meta_aligned$tumor_location,
+    SDHB_IHC = sdhb_vals,
+    col = list(
+      Sex      = sex_colors,
+      Location = loc_colors,
+      SDHB_IHC = sdhb_colors
+    ),
+    annotation_name_gp = gpar(fontsize = 9, fontface = "bold"),
+    simple_anno_size   = unit(4, "mm"),
+    show_legend        = c(TRUE, TRUE, TRUE)
+  )
+}
+
 # =============================================================================
 # 5.  CLUSTERING  +  COLUMN SPLIT
 # =============================================================================
@@ -570,7 +637,227 @@ plot_arm_heatmap <- function(mat, sp) {
 }
 
 # =============================================================================
-# 9.  ORCHESTRATOR / MAIN EXECUTION
+# 9a. HEATMAP 3 — Whole-genome + clinical annotation (SDHB IHC + Germline)
+# =============================================================================
+
+plot_genome_heatmap_clinical <- function(mat, sp) {
+  col_fun   <- make_log2_color_fun(sp)
+  col_clust <- ward_col_clust(mat)
+  col_split <- derive_column_split(col_clust, ncol(mat))
+
+  top_anno <- build_extended_annotation(mat, META_FILE, CLINICAL_FILE)
+
+  chrom_of_arm   <- sub("[pq]$", "", rownames(mat))
+  chrom_factor   <- factor(chrom_of_arm, levels = paste0("chr", 1:22))
+  compact_labels <- sub("chr", "", rownames(mat))
+
+  ht_args <- list(
+    mat,
+    name               = "log2 ratio",
+    col                = col_fun,
+    cluster_rows       = FALSE,
+    cluster_row_slices = FALSE,
+    cluster_columns    = col_clust,
+    column_split       = col_split,
+    column_gap         = unit(3, "mm"),
+    cluster_column_slices = FALSE,
+    row_split          = chrom_factor,
+    row_gap            = unit(1, "mm"),
+    show_row_names     = TRUE,
+    row_labels         = compact_labels,
+    show_column_names  = TRUE,
+    row_names_gp       = gpar(fontsize = 8),
+    column_names_gp    = gpar(fontsize = 7),
+    column_names_rot   = 50,
+    column_title       = NULL,
+    column_title_gp    = gpar(fontsize = 0),
+    row_title_gp       = gpar(fontsize = 9, fontface = "bold"),
+    row_title_rot      = 0,
+    border             = TRUE,
+    border_gp          = gpar(col = "grey30", lwd = 0.8),
+    rect_gp            = gpar(col = "grey90", lwd = 0.3),
+    row_names_side     = "left",
+    heatmap_legend_param = legend_params(sp)
+  )
+
+  if (!is.null(top_anno)) ht_args$top_annotation <- top_anno
+
+  ht <- do.call(Heatmap, ht_args)
+
+  out_path <- file.path(VIZ_DIR, "cnv_genome_heatmap_clinical.png")
+  png(out_path, width = 1800, height = 1200, res = 150, bg = "white")
+  draw(ht,
+       heatmap_legend_side    = "right",
+       annotation_legend_side = "right",
+       merge_legends          = FALSE,
+       padding                = unit(c(8, 8, 8, 8), "mm"),
+       column_title    = "Whole-Genome CNV Profile — SDHB IHC",
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"))
+  dev.off()
+  message("  [SAVED] ", out_path)
+}
+
+# =============================================================================
+# 9b. HEATMAP 4 — Chromosome-arm + clinical annotation (SDHB IHC + Germline)
+# =============================================================================
+
+plot_arm_heatmap_clinical <- function(mat, sp) {
+  col_fun   <- make_log2_color_fun(sp)
+  col_clust <- ward_col_clust(mat)
+  col_split <- derive_column_split(col_clust, ncol(mat))
+
+  top_anno <- build_extended_annotation(mat, META_FILE, CLINICAL_FILE)
+
+  chrom_of_arm   <- sub("[pq]$", "", rownames(mat))
+  chrom_factor   <- factor(chrom_of_arm, levels = ARM_CHROMS)
+  compact_labels <- sub("chr", "", rownames(mat))
+
+  ht_args <- list(
+    mat,
+    name               = "log2 ratio",
+    col                = col_fun,
+    cluster_rows       = FALSE,
+    cluster_row_slices = FALSE,
+    cluster_columns    = col_clust,
+    column_split       = col_split,
+    column_gap         = unit(3, "mm"),
+    cluster_column_slices = FALSE,
+    row_split          = chrom_factor,
+    row_gap            = unit(3, "mm"),
+    row_title_gp       = gpar(fontsize = 9, fontface = "bold"),
+    row_title_rot      = 0,
+    show_row_names     = TRUE,
+    row_labels         = compact_labels,
+    show_column_names  = TRUE,
+    row_names_gp       = gpar(fontsize = 9, fontface = "bold"),
+    column_names_gp    = gpar(fontsize = 7),
+    column_names_rot   = 50,
+    column_title       = NULL,
+    column_title_gp    = gpar(fontsize = 0),
+    border             = TRUE,
+    border_gp          = gpar(col = "grey30", lwd = 0.8),
+    rect_gp            = gpar(col = "grey90", lwd = 0.4),
+    heatmap_legend_param = legend_params(sp)
+  )
+
+  if (!is.null(top_anno)) ht_args$top_annotation <- top_anno
+
+  ht <- do.call(Heatmap, ht_args)
+
+  out_path <- file.path(VIZ_DIR, "cnv_arm_heatmap_clinical.png")
+  png(out_path, width = 1600, height = 1000, res = 150, bg = "white")
+  draw(ht,
+       heatmap_legend_side    = "right",
+       annotation_legend_side = "right",
+       merge_legends          = FALSE,
+       padding                = unit(c(8, 8, 8, 8), "mm"),
+       column_title    = paste0(
+         "Chromosome-Arm CNV Profile — SDHB IHC  ·  ",
+         paste(ARM_CHROMS, collapse = "  ·  ")
+       ),
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"))
+  dev.off()
+  message("  [SAVED] ", out_path)
+}
+
+# =============================================================================
+# 9c. HEATMAP 5 — Arm level, columns split by combined clinical group
+#     Single annotation bar: germline variant (SDHD/SDHB) takes priority,
+#     then SDHB IHC pos/neg, then Unknown for samples with no data.
+# =============================================================================
+
+plot_arm_heatmap_clinical_grouped <- function(mat, sp) {
+  if (!file.exists(META_FILE) || !file.exists(CLINICAL_FILE)) {
+    message("  [SKIP] Missing META_FILE or CLINICAL_FILE for grouped heatmap")
+    return(invisible(NULL))
+  }
+
+  clin_df <- read_excel(CLINICAL_FILE)
+  colnames(clin_df) <- c("sample_base", "sdhb_ihc", "germline_variant")
+
+  target_samples <- colnames(mat)
+  base_ids       <- sub("-t$", "", target_samples)
+  clin_aligned   <- clin_df[match(base_ids, clin_df$sample_base), ]
+
+  # Combined label based on SDHB IHC only
+  clinical_group <- sapply(clin_aligned$sdhb_ihc, function(sdhb) {
+    sdhb <- if (is.na(sdhb)) "Unknown" else as.character(sdhb)
+    if (sdhb == "pos") "SDHB-IHC pos"
+    else if (sdhb == "neg") "SDHB-IHC neg"
+    else "Unknown"
+  })
+
+  all_group_colors <- c(
+    "SDHB-IHC pos" = "#D62728",
+    "SDHB-IHC neg" = "#1F77B4",
+    "Unknown"      = "#BDBDBD"
+  )
+  group_colors <- all_group_colors[names(all_group_colors) %in% unique(clinical_group)]
+
+  top_anno <- HeatmapAnnotation(
+    Clinical_Group   = clinical_group,
+    col              = list(Clinical_Group = group_colors),
+    annotation_name_gp = gpar(fontsize = 9, fontface = "bold"),
+    simple_anno_size   = unit(5, "mm"),
+    show_legend        = TRUE
+  )
+
+  col_fun      <- make_log2_color_fun(sp)
+  group_factor <- factor(clinical_group,
+                         levels = c("SDHB-IHC pos", "SDHB-IHC neg", "Unknown"))
+
+  chrom_of_arm   <- sub("[pq]$", "", rownames(mat))
+  chrom_factor   <- factor(chrom_of_arm, levels = ARM_CHROMS)
+  compact_labels <- sub("chr", "", rownames(mat))
+
+  ht <- Heatmap(
+    mat,
+    name                  = "log2 ratio",
+    col                   = col_fun,
+    cluster_rows          = FALSE,
+    cluster_row_slices    = FALSE,
+    cluster_columns       = TRUE,
+    clustering_method_columns = "ward.D2",
+    clustering_distance_columns = "euclidean",
+    column_split          = group_factor,
+    column_gap            = unit(4, "mm"),
+    cluster_column_slices = FALSE,
+    row_split             = chrom_factor,
+    row_gap               = unit(3, "mm"),
+    row_title_gp          = gpar(fontsize = 9, fontface = "bold"),
+    row_title_rot         = 0,
+    show_row_names        = TRUE,
+    row_labels            = compact_labels,
+    show_column_names     = TRUE,
+    row_names_gp          = gpar(fontsize = 9, fontface = "bold"),
+    column_names_gp       = gpar(fontsize = 7),
+    column_names_rot      = 50,
+    column_title_gp       = gpar(fontsize = 9, fontface = "bold"),
+    border                = TRUE,
+    border_gp             = gpar(col = "grey30", lwd = 0.8),
+    rect_gp               = gpar(col = "grey90", lwd = 0.4),
+    top_annotation        = top_anno,
+    heatmap_legend_param  = legend_params(sp)
+  )
+
+  out_path <- file.path(VIZ_DIR, "cnv_arm_heatmap_clinical_grouped.png")
+  png(out_path, width = 1800, height = 1000, res = 150, bg = "white")
+  draw(ht,
+       heatmap_legend_side    = "right",
+       annotation_legend_side = "right",
+       merge_legends          = FALSE,
+       padding                = unit(c(8, 8, 8, 8), "mm"),
+       column_title    = paste0(
+         "Chromosome-Arm CNV Profile — Grouped by Clinical Status  ·  ",
+         paste(ARM_CHROMS, collapse = "  ·  ")
+       ),
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"))
+  dev.off()
+  message("  [SAVED] ", out_path)
+}
+
+# =============================================================================
+# 10.  ORCHESTRATOR / MAIN EXECUTION
 # =============================================================================
 
 main <- function() {
@@ -591,12 +878,20 @@ main <- function() {
   message("Plotting whole-genome heatmap...")
   plot_genome_heatmap(mat_genome, sp)
   
-  # 4. Chromosome-Arm Targeted Heatmap
   message("\nBuilding targeted arm matrix...")
   mat_arm <- build_arm_matrix(segs)
   message("Plotting targeted arm heatmap...")
   plot_arm_heatmap(mat_arm, sp)
-  
+
+  message("\nPlotting whole-genome heatmap with clinical annotation...")
+  plot_genome_heatmap_clinical(mat_genome, sp)
+
+  message("Plotting targeted arm heatmap with clinical annotation...")
+  plot_arm_heatmap_clinical(mat_arm, sp)
+
+  message("Plotting arm heatmap grouped by clinical status...")
+  plot_arm_heatmap_clinical_grouped(mat_arm, sp)
+
   message("\n=== Pipeline Execution Completed Successfully ===")
 }
 
